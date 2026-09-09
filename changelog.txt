@@ -1,0 +1,478 @@
+Jun 29 @ 8:50AM - new
+
+Jun 30 - fix phantom sell "loss" on clamped partial fills (coin_runner._finalize_sell).
+  When a live sell got clamped to free balance (free < tracked qty), the bot
+  charged the WHOLE position's cost basis against the proceeds of a partial
+  fill, fabricating a loss (SYN cycle 6: real result +$17 booked as -$175.45),
+  then silently dropped the unsold coins. Now: book PnL on the sold portion
+  only (proportional cost), keep the remainder on the books, and PAUSE the coin
+  for manual reconciliation. Full-close and fee-dust paths unchanged.
+  NOTE: restart the bot for this to take effect; live state files untouched.
+
+Jun 30 - fix dropped partial fills on sell cancel (coin_runner.check_pending_sell) [ROOT CAUSE].
+  When a resting limit sell was cancelled (price fell below the trail threshold)
+  or ended canceled/expired/rejected, the code cleared the pending order WITHOUT
+  booking any portion that had already executed -- silently selling coins the bot
+  never recorded. This is what desynced SYN (order OTZYY2 filled 696/740 before
+  the cancel landed, booked as nothing). Now: on cancel/terminal, re-fetch and
+  route any filled portion through _finalize_sell. A clamped order (real balance
+  shortfall) pauses on partial; a full-size order that just didn't fully fill
+  keeps trading (remainder is back in free balance).
+
+Jun 30 - audited all coins except BTC against the Kraken ledger (avg-cost). Corrected
+  realized_pnl_usd (backups .bak written): SYN -57.31->+174.52, TAO +45.23->+62.47,
+  VVV +37.20->+47.48. In sync: XMR, ZEC, TRX. Left alone (need manual review):
+  HYPE (true spot +52.80 vs +32.96; a tiny HYPEUSD:BTNL side-market excluded),
+  NEAR (+20.80 vs +18.66 AND open position under-tracks ~45 coins / ~$112 held but
+  unmanaged), NEO + INJ (realized=0/cycle=0 but have Kraken sell history -> looks
+  reset or manually traded; not auto-corrected).
+
+Jun 30 - handled HYPE + NEAR (backups .bak written).
+  HYPE: realized +32.96 -> +52.80 (spot-only; HYPEUSD:BTNL side-market excluded).
+  Position left as-is (~0.07 coin / ~$4.6 dust under-track, immaterial).
+  NEAR: realized +20.80 -> +18.66 AND rebuilt the open position. The lot list
+  already summed to ~524.55 coins (matching balance) but total_qty_coin/cost/avg
+  fields were stale at 479.77 @ $2.0365 (level 14's ~44.78 was never added to the
+  totals). Rebuilt to the real 524.69 balance at the ledger avg-cost $2.0540
+  (+0.86%), scaling the 18 lots to keep totals consistent and grid depth (18/20)
+  so it won't over-buy. cycle/last_buy/initial_entry_high preserved.
+
+Jul 1 - menu: select coins by number (not just 1-9) + drop the Y-confirm on config.
+  conductor._on_keypress. Coin picking now buffers digits and commits on ENTER
+  (BACKSPACE edits; e.g. "12"+ENTER opens the 12th coin), so selection is no longer
+  capped at single-digit 1-9. Action #2 (config) now prints immediately like #1
+  (live stats) instead of demanding "Y" -- it's a read-only view. Action-menu keys
+  (single-press) and every mutating action's Y-confirm are unchanged.
+  NOTE: restart the bot for this to take effect.
+
+Jul 1 - status column: show pending limit orders + trailing state (conductor).
+  The all-coins 'a' summary and the startup coin list now tag each coin's live
+  state via a shared _status_tags(): [BUY LIMIT @$x] / [SELL LIMIT @$x] for a
+  resting order, else [BUY-TRAIL DN ->$x] / [SELL-TRAIL UP ->$x] where ->$x is
+  the live trigger price the trail fires at (same math as format_stats: buy =
+  low*(1+trail_buy_pct), sell = high*(1-trail_sell_pct)). UP = riding the high
+  to sell, DN = riding the low to buy; " MAN" = manually-armed sell-trail. Per
+  side a resting order takes precedence over the trail, matching format_stats.
+  Existing [PAUSED]/[BE-EXIT]/[PAUSE-AFTER-SELL] tags unchanged; the startup
+  banner now shows those two as well. Display-only; no order logic touched.
+  NOTE: restart the bot for this to take effect.
+
+Jul 1 - fix dropped LIMIT-BUY fills on cancel (coin_runner.check_pending_buy) [ROOT CAUSE].
+  Buy-side twin of the Jun 30 sell-cancel fix. When a resting limit BUY was
+  cancelled (price ticked back above the cancel threshold), the code cleared
+  the pending order WITHOUT booking any portion that had already executed in
+  the fetch->cancel race window -- silently buying coins the bot never recorded.
+  This desynced M/USD's initial entry: 3 buys filled on Kraken but only the last
+  was booked (position stuck at 1/10), and because the bot kept believing it had
+  0 positions it re-ran initial-entry near ~$1.28 instead of advancing to the
+  drop_pct-spaced grid (so drop% "wasn't followed"). Now: on cancel, re-fetch
+  and route any filled qty through _finalize_buy.
+  NOTE: restart to apply. state_M_USD.json still needs a manual ledger
+  reconcile for the 2 unbooked fills (backup .bak first).
+
+Jul 1 - patch the same buy-cancel race in the manual force-buy path
+  (coin_runner.execute_buy). When force-buy (menu 7 / 'b') cancels a pending
+  LIMIT-BUY to place a market buy, it now re-fetches and books any qty that
+  filled before the cancel landed, then skips the market buy (books the fill
+  rather than doubling the lot). Completes buy-side coverage of the fill-on-
+  cancel race started above.
+
+Jul 1 - reconciled state_M_USD.json to the Kraken ledger (.bak written).
+  1 lot 57.51 @ $1.307 -> 3 lots totalling 175.35 M @ $1.283 ($225 cost),
+  grid depth 3/10, cycle/realized preserved (0). Left PAUSED for review.
+
+Jul 5 - retire-coin feature: remove a coin permanently but keep its PnL.
+  New menu action r) RETIRE (Y-confirm): books the coin's lifetime realized
+  PnL + cycles into data/retired_pnl.json (new helpers/retired.py; file is
+  HUMAN-EDITABLE -- hand-add old coins like TRX), then does a clear_stats-style
+  full reset and leaves the coin PAUSED. Ledger write happens FIRST and the
+  reset is aborted if it fails (never zero unbooked PnL); repeat retire
+  accumulates. The zeroed+paused state file is deliberately kept as the
+  restart guard -- set "enabled": False in helpers/config.py at leisure, then
+  the state file can be deleted by hand. Both totals now include retired PnL:
+  the 'a' summary shows a "Retired PnL" line folded into Total realized, and
+  the Blynk V0 push adds it too (terminal and dashboard stay in agreement).
+  NOTE: restart the bot for this to take effect.
+
+Jul 5 - hot-reload config tunables ('c' key) + hide paper-wallet lines when
+  PAPER_STARTING_USD == 0. New idle-level key 'c': re-parses helpers/config.py
+  in a throwaway namespace (never importlib.reload -- a failed parse changes
+  nothing), prints a per-coin diff of the RUNNING coins' tunables plus
+  needs-restart warnings (coin added/removed/enabled-flipped, COINS reordered),
+  then applies on Y by swapping each changed coin's dict IN PLACE (the same
+  object every task/Blynk push holds), one audit line per coin in grid_bot.log.
+  Malformed entries (missing required key, non-int price_prec, non-numeric
+  tunable) abort the whole reload before anything applies. Structural changes
+  and module constants (fees, cooldowns, fill timeout, Blynk/Pushover,
+  PAPER_STARTING_USD) still need a restart; a coin disabled in the file is
+  skipped entirely (pause it via menu 4 until then). New helpers/config_reload.py
+  holds the pure parse/diff/apply logic. Display: the "Paper wallet" lines in
+  per-coin stats and the 'a' summary are hidden when PAPER_STARTING_USD == 0
+  (live-only cockpit); wallet.json still loads.
+  NOTE: restart once to get the feature -- after that, tunable edits no longer
+  need restarts.
+
+
+Jul 13 - per-coin STOP-LOSS, settable from the coin's action menu (new key 's').
+  Set as a percent below avg entry (type the number + ENTER, then Y); the
+  trigger price is recomputed every tick as avg * (1 - pct), so it tracks the
+  average down as the grid adds levels. 0/empty clears; value survives restarts
+  (new State.stop_loss_pct in the state JSON). On hit: cancels any resting
+  limit BUY (booking a raced pre-cancel fill first -- otherwise the buy could
+  fill mid-crash even while paused), market-sells ALL (force-market path also
+  cancels a resting limit sell), pauses the coin via the pause-after-sell
+  mechanism, then disarms (one-shot). Disarm happens only AFTER the sell call
+  succeeds, so an exchange error mid-crash leaves it armed to retry next tick.
+  Checked outside the action cooldown (a crash right after a buy still stops
+  out) and ahead of the trail handlers; skipped while paused. Unlike the manual
+  sell-trail (menu 3), this deliberately sells AT A LOSS -- no avg-entry floor.
+  clear-stats/retire also wipe it. Display: '[SL ->$trigger]' tag in the
+  startup banner + 'a' table, '[SL -x.xx%]' on the stats mode line, and a
+  'Stop-loss:' detail line with the live trigger + %-from-now. The buy-side
+  cancel+book logic was extracted from execute_buy into
+  cancel_pending_buy_and_book() and is shared by both paths (log wording there
+  changed slightly). Setting a stop below the current price warns loudly and
+  fires on the next tick after confirm.
+  NOTE: restart the bot for this to take effect. Rollback caveat: state files
+  written by this version contain "stop_loss_pct" -- older code refuses the
+  key and starts that coin's state FRESH; strip it from data/state_*.json
+  before downgrading.
+
+Jul 21 - per-coin TARGET SELL at a user price, settable from the coin's action menu
+  (new key 'p'). Type an absolute price + ENTER + Y: places a REAL post-only
+  limit sell on Kraken for the WHOLE position at that price (maker fee; fills
+  even while the bot is down). New PendingSellOrder.manual flag marks it:
+  exempt from the trail auto-cancel rule in check_pending_sell (rests until
+  filled or cleared -- normally a resting sell cancels when price drops
+  trail_sell_pct below the limit), and grid buys are FROZEN while it rests
+  (run_coin buy-trail gate) so the position can't grow out from under the
+  order. On fill the coin pauses via the pause-after-sell mechanism (armed at
+  placement, consumed by _finalize_sell) -- i.e. menu 6 behavior at your own
+  price. 'p' -> 0/empty -> Y clears: cancels the resting order (booking any
+  raced pre-cancel partial via new cancel_pending_sell_and_book, the sell-side
+  mirror of cancel_pending_buy_and_book), disarms pause-after-sell, unfreezes
+  buys. Setting refuses a target at/below current price, and a live postOnly
+  rejection is a HARD refusal -- it does NOT fall back to a market sell like
+  the bot's own auto limit path does. Placing a target replaces any resting
+  auto limit sell (raced partials booked) and cancels a resting limit buy
+  (raced fill folded into the position first, so the target covers it).
+  Bracket with the stop-loss works: if the stop fires first it force-cancels
+  the target inside execute_sell_all's market path (note: that block keeps its
+  existing no-refetch behavior -- a partial that raced THAT cancel books via
+  the desync pause, unchanged). Menu 8 / clear-stats / retire dismantle the
+  target as before. If the order is cancelled on Kraken's website the bot
+  clears it on the next poll (OrderNotFound) but pause-after-sell stays armed
+  -- disarm via menu 6 if unwanted. Display: '[TARGET @$x]' tag (banner + 'a'
+  table), and stats show 'Pending TARGET SELL' with 'Cancels when: never'.
+  UI: the stop-loss value-entry mode was generalized (val_entry/VALUE_KINDS)
+  to serve both 's' (percent) and 'p' (absolute price); stop-loss UX text is
+  unchanged.
+  NOTE: restart the bot for this to take effect. Rollback caveat: while a
+  target rests, the state JSON's pending_sell_order contains a "manual" key --
+  older code refuses the key and starts that coin's state FRESH; clear the
+  target (or strip the key from data/state_*.json) before downgrading.
+
+Jul 21 - renumbered the coin action menu (display order + keys). New layout:
+  1 stats, 2 config, 3 set/clear stop-loss, 4 pause, 5 breakeven-exit,
+  6 pause-after-sell, 7 force BUY, 8 sell ALL now (market), 9 sell ALL at MY
+  price (target sell), a arm sell-trail, t clear targets, r RETIRE,
+  c clear stats (FULL reset). Key changes vs before: stop-loss s->3,
+  target-sell p->9, arm-sell-trail 3->a, clear-stats 9->c. Unchanged: 1,2,4,5,
+  6,7,8,t,r. 'a' and 'c' now double as action keys (arm sell-trail / clear
+  stats) -- they still mean all-coin-stats / reload-config at the IDLE screen,
+  which is a separate input context (a coin must be selected for the action
+  menu), so no clash. Stale "menu p" / "option #3" hints in stats output, logs
+  and comments were updated to "menu 9" / "menu a". Pure UI change -- no trading
+  behavior or state-file format change.
+  NOTE: restart the bot for this to take effect.
+
+Jul 21 - added manual BUY-TRAIL (new menu key 8, "arm buy-trail") -- the mirror
+  of arm sell-trail (menu a). Arms immediately at the current price (bypassing
+  the grid's drop_pct trigger), trails the price DOWN tracking the low, and
+  fires ONE buy when price rebounds trail_buy_pct off that low. Works whether
+  flat (fires the initial entry, level 0) or holding a position (fires the next
+  grid level); refused only when the grid is full, a limit buy is already
+  pending, or a manual target sell is resting (buys frozen). The fired buy
+  honors cfg['buy_order_type'] (no force_market), exactly like the automatic
+  buy-trail and the manual sell-trail's fire. Unlike the auto buy-trail it never
+  disarms on its own -- it ends by firing, a full sell/reset, or clear-targets
+  (menu t). While armed it owns the trailing_buy slot, so the automatic
+  entry/grid trails are suppressed until it fires or is cleared; the take-profit
+  sell-trail (separate slot) still runs normally. No state-file format change --
+  reuses the existing TrailState.manual flag on trailing_buy, which already
+  persists (so an armed buy-trail survives restarts). New handler
+  handle_manual_buy_trail + arm_buy_trail branch in apply_manual + a tick-loop
+  route that swaps it in when trailing_buy.manual is armed. Display: '[BUY-TRAIL
+  DN MAN ->$x]' status tag and a "manual dip-buy" note in the per-coin stats
+  Next BUY block.
+  Menu renumber to fit key 8: sell-ALL-now moved 8->9 and target-sell moved
+  9->p (back to its original letter); everything else (1-7, a/t/r/c) unchanged.
+  Stale "menu 8" (sell-now) and "menu 9" (target-sell) hints in stats output,
+  logs and comments were updated to "menu 9" / "menu p".
+  NOTE: restart the bot for this to take effect. No state-file format change,
+  so no rollback caveat this time.
+
+Sep 1 - FIX: wallet-vs-grid drift (tracked position diverging from real Kraken
+  balance) + one-time reconciliation. Root cause: 17 coins share one API key;
+  concurrent private REST calls raced into Kraken "EAPI:Invalid nonce" errors
+  (75 in the logs, 43 in one 08-22 reconnect storm). On a nonce-failed CANCEL,
+  check_pending_sell/buy dropped pending_*_order anyway, orphaning a still-live
+  order that later filled unbooked -> tracked drifted from the wallet (e.g. TAO
+  tracked 0.46451 vs real 0.01844, then 590 "volume minimum not met" retries).
+  Fixes (helpers/coin_runner.py, conductor.py):
+   1. install_private_call_serialization(): all private REST calls go through
+      one asyncio.Lock + a strictly-monotonic nonce, so they can't race.
+      Installed on the shared exchange at startup. Public/WebSocket untouched.
+   2. Cancel paths (check_pending_sell/buy, cancel_pending_{buy,sell}_and_book)
+      no longer drop tracking when a cancel raises -- the order is still live,
+      so we keep it and retry; callers (execute_buy force, execute_target_sell)
+      abort rather than stack an order on top of a live one.
+   3. live_sellable_qty() floors at the market minimum: returns 0 (skip) instead
+      of spamming below-minimum orders -- kills the dust retry loop.
+   4. check_pending_buy closed-with-no-filled now warns instead of silently
+      assuming a full fill.
+   5. reconcile_all_to_exchange(): at startup (live only) each coin's tracked
+      position is mirrored to the real Kraken balance BOTH ways -- shortfalls
+      scale down / clear as dust, surpluses scale up -- preserving avg_entry and
+      grid level count. Keeps tracked == wallet across restarts. (Operator chose
+      "match the exchange both ways"; surplus coins are now managed & sold by the
+      grid.) Coins with no open position are left flat.
+  One-time cleanup applied to data/state_*.json (backup: backup_reconcile_*/):
+   INJ 7.3587 -> 0 (ghost cleared), TAO 0.46451 -> 0 (dust cleared),
+   AAVE/ADA/HYPE/MON/PUMP/VVV/XMR/ZEC scaled UP to the real balances
+   (e.g. ADA 3739 -> 7040, PUMP 64988 -> 143884), avg entry preserved.
+  Paper wallet.json is unused in live mode (frozen at $650) -- unchanged.
+  NOTE: restart the bot to apply. Startup reconciliation will re-mirror to
+  whatever Kraken shows at launch (idempotent now that state == balance).
+
+Sep 8 - NEW: web dashboard (helpers/dashboard.py + helpers/web/) -- live stats,
+  per-coin and total profit, and the full manual control set in a browser.
+  It runs as one more asyncio task INSIDE the bot process, which is the whole
+  point: it reads the same `states`/`last_price`/`wallet`/balance objects the
+  coin tasks are mutating, and every button drops a PendingAction on the same
+  per-coin cmd_queue the keypress menu uses. No second source of truth, no IPC.
+  A command still lands on the coin's next price tick, exactly as from the
+  terminal -- the UI shows "N QUEUED - waiting for next tick" so a quiet pair
+  doesn't look unresponsive.
+  What it shows: totals (realized active + retired + unrealized + net + position
+  value + Kraken/paper USD), a per-coin table (price, levels, avg entry, position
+  value, unrealized, realized, cycles, next-buy/next-sell with % from now, and
+  the same status tags as the 'a' screen), an expandable detail panel per coin
+  (position breakdown, open levels, next buy/sell math, recent log), an
+  inactive/retired section (disabled coins + the retired_pnl.json ledger), and a
+  realized-PnL equity curve.
+  Controls: every action from the terminal menu except 1/2 (stats/config, which
+  the UI renders natively) -- pause, breakeven-exit, pause-after-sell, force BUY,
+  arm buy/sell-trail, sell ALL, target sell, stop-loss, clear targets, clear
+  stats, RETIRE. Each opens a confirm dialog spelling out the consequence (the
+  GUI equivalent of the Y-confirm); RETIRE and clear-stats also require typing
+  the coin's base symbol. After a RETIRE it offers the "enabled": False config
+  edit the CLI tells you to do by hand.
+  Config editing: change a coin's tunables in the browser and they are written
+  back into helpers/config.py AND hot-applied to the running coin (same
+  config_reload.apply_changes path as the 'c' key). The write is surgical --
+  helpers/config_edit.py locates the value's exact source span via the AST and
+  splices the new literal in, so tab alignment, per-coin comments and
+  commented-out coin blocks all survive untouched; small offsets stay in plain
+  decimal (0.00002, not 2e-05). The edited file is parsed and re-checked before
+  it can replace config.py (atomic os.replace), and the previous version is
+  copied to data/config_backups/ (newest 30 kept). Structural keys (enabled)
+  are written to the file but flagged as needing a restart. There's also a
+  "Reload config.py" button = the 'c' key's preview/apply.
+  Profit history (helpers/trade_history.py) is parsed back out of the existing
+  "realized=$..." log lines rather than from a new write path -- read-only, so a
+  parsing bug costs a chart and never a position. Incremental (seeks to where
+  the last parse stopped) and the first full parse runs in a thread at startup
+  so it can't stall the coin tasks.
+  Auth: shared token, DASHBOARD_TOKEN in .env (one was generated for you), sent
+  as ?token= once and then kept in a cookie. The dashboard REFUSES to start on a
+  non-loopback host with an empty token -- it can sell positions, so it is never
+  exposed unauthenticated. Plain HTTP for a trusted LAN: do not port-forward it.
+  Settings live in helpers/config.py (DASHBOARD_ENABLED/HOST/PORT, host+port also
+  overridable via .env or --dashboard-host/--dashboard-port); --no-dashboard
+  turns it off. Every failure path (missing aiohttp, busy port, handler
+  exception) is logged and non-fatal -- the bot keeps trading.
+  REFACTOR: the action menu catalog, the value-entry labels/reasons and the
+  stop-loss / target-sell validators moved out of conductor.py into
+  helpers/actions.py, so the terminal menu and the dashboard offer exactly the
+  same commands with the same wording and can't drift apart. Terminal behavior
+  is unchanged; coin_runner.apply_manual is still the authority that re-validates
+  every command on the tick that executes it.
+  NEW DEPENDENCY: aiohttp (added to helpers/requirements.txt -- it already ships
+  as a ccxt.pro dependency, so nothing new to install in practice).
+  NOTE: restart the bot to get the dashboard. No state-file format change.
+
+Sep 8 - FIX: dashboard page jumped up whenever the live log refreshed while
+  scrolled to the bottom (helpers/web/app.js, style.css). Two causes, both from
+  rebuilding DOM the reader was looking at:
+   1. every 2.5s poll did `#coins-body.innerHTML = ''` and recreated the whole
+      table -- including the open detail panel, so its per-coin log block was
+      rebuilt too and re-fetched, going "loading..." (small) -> 300px full in a
+      LATER task. That's a real page-height change every poll.
+   2. the page log replaced its whole text node every 6s, which destroys the
+      node the browser had picked as its scroll anchor.
+  Fixes: rows, detail panels, config forms and log boxes are now created once,
+  cached by key, and patched in place -- syncChildren() leaves any node already
+  in the right position completely untouched, so only genuinely new or
+  out-of-order nodes move. Log text is only written when it actually changed,
+  the box keeps its own scroll position (still follows if it was at the bottom),
+  and pre.log is now a FIXED 300px with overflow-anchor:none so it can never
+  shift the page or be chosen as a scroll anchor.
+  Side effects of the same change (all improvements): typing in a coin's config
+  form is no longer wiped every 2.5s (it used to lose focus and your edit on
+  each poll), the per-coin log no longer re-fetches 24x/minute (it refreshes on
+  the 6s cadence, in place), and text selection in the table survives a refresh.
+  Verified: with a detail panel open and the page scrolled to the bottom,
+  scrollY / document height / log scroll position and node identity were all
+  unchanged across ~8 polls and 3 log refreshes; sorting, open/close and the
+  inactive-coin panels still behave.
+  Front-end only -- no Python touched, so no restart needed beyond a browser
+  reload (shift-reload to bypass the cached app.js).
+
+Sep 8 - dashboard UI tidy-up (helpers/web/): removed the per-coin "Recent log"
+  block from the coin detail panel entirely -- the page-level log at the bottom
+  already shows everything, and dropping it also removes a per-coin /api/log
+  poll. The detail panel is now Position / Next buy / Next sell / Controls, open
+  levels, and config.
+  "Inactive & retired" and each coin's "Config -- helpers/config.py" are now
+  collapsible with a rotating arrow, both COLLAPSED by default so the page stays
+  scannable. Built on native <details>/<summary> (arrow, click target and
+  keyboard handling for free, no JS state machine); the open/closed choice is
+  remembered per browser in localStorage, guarded so blocked site data just
+  falls back to the default. The collapsed "Inactive & retired" header carries a
+  summary -- coin count and total retired PnL -- so it's useful shut.
+  Also: text is now only written to persistent nodes (header uptime, the
+  disclosure summary) when it actually changed. Assigning textContent replaces
+  the text node even for an identical string, which is the same churn behind the
+  scroll-jump fixed above.
+  Front-end only; browser reload picks it up (shift-reload to bypass cached JS).
+
+Sep 8 - dashboard: the selected coin's detail panel no longer splits the coin
+  list. It used to be injected as an extra <tr> right under the row you clicked,
+  which pushed every coin below it a screen further down. Now the list stays
+  whole and grouped, the selected row is highlighted (blue left accent + lighter
+  background + brighter symbol), and the panel renders in its own container
+  BELOW the table -- so the rows never move under your cursor when you click
+  through coins, and the table's position is identical whether a coin is open or
+  not.
+  The panel gained a header: index + symbol, a live one-line summary (price,
+  levels, unrealized, realized) and a Close button, since it is no longer
+  visually attached to the row it belongs to. On selecting a DIFFERENT coin it
+  scrolls itself into view with block:'nearest', which does nothing when it is
+  already on screen.
+  Node caching still applies -- switching coins swaps the panel, polls patch it
+  in place, and sorting keeps both the selection and the panel intact.
+  Front-end only; browser reload picks it up.
+
+Sep 8 - dashboard: active-coins columns are now drag-to-reorder. Grab any column
+  header and drop it where you want; a blue edge marks which side it will land
+  on, and the order is remembered per browser (localStorage). A "Reset columns"
+  button appears next to the section title whenever the order differs from the
+  default and puts it back.
+  To make that possible the columns became DATA rather than being split between
+  a hardcoded <thead> in index.html and a matching cell-builder in app.js -- the
+  two had to be kept in sync by hand, which would have broken the first time a
+  column was added. There is now one COLUMNS list (key, label, alignment, sort
+  field, cell builder) that generates both the header and every row, so header
+  and cells cannot disagree about the order.
+  Sorting still works by clicking a header, and now shows which column and
+  direction with a caret; a click that lands at the end of a drag is suppressed
+  so dropping a column doesn't also re-sort the table. A saved order is repaired
+  on load against the current column set -- unknown keys dropped, new columns
+  appended -- so a stale localStorage entry from an older build can never blank
+  out the table.
+  Front-end only; browser reload picks it up.
+
+Sep 8 - dashboard: added a "Total value" card as the first tile in the totals
+  strip -- everything held right now, cash + coins at the latest tick price,
+  with "cash $X + coins $Y" underneath.
+  The coin side deliberately prefers the REAL exchange balance over the bot's
+  tracked grid position, because they are not the same number: the wallet also
+  holds prior holdings, manual buys and dust left by a clear-stats (the existing
+  per-coin "untracked" figure). New totals in /api/snapshot: cash_usd,
+  holdings_value, holdings_basis ("wallet" | "tracked"), untracked_value,
+  total_value, coins_valued_from_wallet, coins_no_price, inactive_holding.
+  It says what it could not see rather than quietly under-reporting: cash is
+  None until the first balance poll lands (card reads "$X +cash / waiting for
+  the first balance fetch" instead of counting cash as zero); coins Kraken
+  omitted from the balance payload are noted as "N coin(s) valued from grid
+  qty"; coins whose stream hasn't ticked yet are counted as "no price yet"; and
+  a disabled coin still holding a position is flagged as excluded (it has no
+  ticker, so it cannot be valued). Hovering the card explains the basis in full.
+  In paper mode the cash side is the shared paper pool and there are no exchange
+  balances, so it values from tracked positions with no extra caveat noise.
+  Also converted the totals cards to the same cached/patched rendering as the
+  rest of the page rather than rebuilding the strip on every poll.
+  Front-end + dashboard.py snapshot only -- no trading code touched. The bot
+  must be restarted for the new snapshot fields (it is a Python change).
+
+Sep 8 - dashboard totals reworked to show REAL assets only (operator's call:
+  "a total of all assets that are real, nothing unrealized").
+   - "Kraken USD" (cash only), "Paper wallet" and the "Total value" card added
+     earlier are now ONE headline card: "Kraken account" in live mode / "Paper
+     portfolio" in paper. Big number = cash + coins at the latest tick price,
+     sub-line = the cash/coins split, plus the balance age in live mode. No
+     unrealized PnL is folded into it -- it is what you could liquidate to.
+   - "Net position" (realized + unrealized) REMOVED. Adding banked historical
+     PnL to a mark-to-market figure produced a number that was neither, which
+     is exactly what the operator flagged.
+   - "Unrealized" stays as its own card, now labelled "mark-to-market -- not
+     banked, not in the account total" so it can't be mistaken for money in
+     hand. "Position value" absorbed the open-level count from the old
+     unrealized card and keeps showing cost basis.
+  Strip is now: Kraken account · Total realized · Position value · Unrealized ·
+  Coins (was seven cards, two of which double-counted).
+  Coins are still valued from the real exchange balance when it is known and
+  from the tracked grid position otherwise, with the same caveats as before
+  (partial balances, coins with no price yet, disabled coins holding a
+  position). Hovering the card spells out the basis.
+  Front-end only this time -- the snapshot fields landed in the previous entry.
+
+Sep 9 - dashboard layout tidy-up (helpers/web/):
+   - Removed the "Coins" totals card (active count / holding / paused). The
+     table already shows all of it, and the paused ones carry a PAUSED badge.
+     Totals strip is now four cards: account · realized · position value ·
+     unrealized.
+   - Merged the detail panel's "Next buy" and "Next sell" blocks into one
+     "Next buy / sell" block, with BUY and SELL sub-headings inside it. Both
+     were mostly empty on their own; the detail grid is now three blocks
+     (Position · Next buy/sell · Controls) instead of four, so each gets more
+     width. fillKv() grew support for a bare string in its row list, which
+     renders as a full-width sub-heading spanning both kv columns.
+   - "Controls" is now collapsible, same native <details> mechanism as Config
+     and Inactive & retired, and remembered per browser. It defaults OPEN --
+     the controls are the reason you open a coin -- but collapsing it sticks.
+     The live Pause/Resume relabel still works while it is collapsed.
+  Front-end only; browser reload picks it up.
+
+Sep 9 - dashboard: coin logos in the coin list, detail header and the
+  inactive/retired table (helpers/icons.py + helpers/web/).
+  Logos are cached LOCALLY: fetched once into data/icons/ and served from there
+  by the dashboard, so opening the page makes no third-party request and does
+  not tell anyone which coins you trade. Nothing fetches on its own -- the bot
+  never reaches out for icons as a side effect of trading. A fetch happens only
+  when you press "Fetch icons" in the header (runs in a thread, off the trading
+  event loop) or run `python helpers/icons.py` directly.
+  Any coin without a cached logo falls back to a generated monogram badge --
+  ticker letters on a colour derived from a hash of the ticker, so it is stable
+  and distinct per coin. That is also the fallback if a cached file goes missing
+  behind its manifest entry, so a broken image is never shown.
+  Matching is by ticker against CoinGecko's top 1000 by market cap, which is a
+  GUESS: tickers are not unique. The chosen id is recorded in the manifest and
+  named in the refresh report so a wrong pick is visible. Correct one by putting
+  the right CoinGecko id in data/icons/overrides.json; overrides resolve via a
+  direct id lookup, so they work for coins outside the top 1000, and are only
+  re-fetched when the override actually changes.
+  All 19 configured pairs matched on the first run. TON needed an override --
+  the bare ticker matched Tokamak Network, not Toncoin (data/icons/overrides.json
+  now pins TON to "the-open-network"). Worth checking AI, which matched
+  "Artificial Inu"; if Kraken's AI is a different token, override it the same way.
+  Serving is deliberately narrow: the route accepts a bare alphanumeric ticker
+  only, resolves the file through the manifest (nothing outside data/icons/ is
+  reachable), sniffs the content type from the bytes instead of trusting the
+  extension, and sends X-Content-Type-Options: nosniff. Downloads are capped at
+  512KB and only PNG/JPEG/GIF magic bytes are accepted -- SVG is refused, since
+  it can carry script and these files are served back to the browser.
+  data/icons/ is inside the gitignored data/ dir, so a fresh clone starts with
+  no icons and one button press populates them.
+  NOTE: needs a restart (new Python module + snapshot field).

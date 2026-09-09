@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>gridBot</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>&#128200;</text></svg>">
+</head>
+<body>
+
+<header>
+  <h1>gridBot</h1>
+  <span id="mode-badge" class="badge plain">connecting</span>
+  <span id="conn" class="dot dead" title="waiting for first poll"></span>
+  <span id="conn-text" class="small muted">connecting…</span>
+  <span class="spacer"></span>
+  <button id="btn-icons" class="tiny">Fetch icons</button>
+  <button id="btn-reload-config" class="tiny">Reload config.py</button>
+  <button id="btn-pause-poll" class="tiny">Pause refresh</button>
+</header>
+
+<main>
+  <section id="totals-sec">
+    <h2>Totals</h2>
+    <div id="totals" class="cards"></div>
+  </section>
+
+  <section id="chart-sec">
+    <div class="panel" style="padding:14px 16px">
+      <div class="chart-head">
+        <h2 style="margin:0">Realized PnL <span class="dim small">from logs</span></h2>
+        <span class="spacer" style="flex:1"></span>
+        <span id="chart-scope" class="small muted"></span>
+        <button id="btn-chart-all" class="tiny">All coins</button>
+      </div>
+      <div id="chart"></div>
+    </div>
+  </section>
+
+  <section id="coins-sec">
+    <h2>Active coins
+      <span class="dim">— click a row for controls &amp; config, drag a column header to reorder</span>
+      <button id="btn-reset-cols" class="tiny" hidden>Reset columns</button>
+    </h2>
+    <div class="panel" style="overflow-x:auto">
+      <table id="coins">
+        <thead><tr id="coins-head"></tr></thead>
+        <tbody id="coins-body"></tbody>
+      </table>
+    </div>
+    <div id="coin-detail"></div>
+  </section>
+
+  <section id="inactive-sec">
+    <details class="disclosure section-disclosure" id="inactive-disclosure">
+      <summary>
+        <span class="caret">▸</span>
+        <span class="disclosure-title">Inactive &amp; retired</span>
+        <span id="inactive-summary" class="dim small"></span>
+      </summary>
+      <div class="disclosure-body panel" style="overflow-x:auto">
+      <table id="inactive">
+        <thead>
+          <tr>
+            <th class="l">Symbol</th>
+            <th class="l">State</th>
+            <th>Retired PnL</th>
+            <th class="hide-sm">Retired on</th>
+            <th>Leftover state</th>
+            <th class="l"></th>
+          </tr>
+        </thead>
+        <tbody id="inactive-body"></tbody>
+      </table>
+      </div>
+    </details>
+  </section>
+
+  <section id="log-sec">
+    <h2>Bot log
+      <button id="btn-log-refresh" class="tiny" style="margin-left:8px">Refresh</button>
+      <button id="btn-log-follow" class="tiny">Following</button>
+    </h2>
+    <pre id="log" class="log">loading…</pre>
+  </section>
+</main>
+
+<div id="modal-root"></div>
+<div id="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

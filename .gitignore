@@ -1,0 +1,29 @@
+# Secrets -- Kraken API key/secret, Pushover, Blynk, dashboard token.
+# NEVER commit this file.
+.env
+
+# Live trading state: positions, balances, PnL, full activity log.
+data/
+
+# Local config.py backups written by the dashboard's config editor.
+helpers/data/
+config_backups/
+
+# One-off reconciliation snapshots
+backup_reconcile_*/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editor / OS noise (this project lives on an SMB share, hence ._*)
+.DS_Store
+._*
+*.bak
+*.bak[0-9]
+*.tmp-edit
+.idea/
+.vscode/
