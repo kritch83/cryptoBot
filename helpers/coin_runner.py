@@ -322,13 +322,16 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def paper_buy(wallet: PaperWallet, usd: float, state: State, ticker: dict) -> dict:
+async def paper_buy(wallet: PaperWallet, usd: float, state: State, ticker: dict) -> Optional[dict]:
+    """Simulated market buy. Returns None if the shared paper pool is short --
+    the caller must not book a position for money that was never spent."""
     fill_price = ticker.get("ask") or ticker.get("last")
     if fill_price is None:
         raise RuntimeError("paper_buy: no ask/last on ticker")
     fee_usd = usd * TAKER_FEE_PCT
     qty_coin = (usd - fee_usd) / fill_price
-    await wallet.spend(usd)
+    if not await wallet.try_spend(usd):
+        return None
     state.paper_wallet_coin += qty_coin
     return {"qty": qty_coin, "price": fill_price, "fee_usd": fee_usd, "ts": _now_iso()}
 
@@ -809,6 +812,12 @@ async def execute_buy(exchange, state: State, wallet: PaperWallet, cfg: dict,
         fill = await live_buy(exchange, symbol, usd, ticker)
     else:
         fill = await paper_buy(wallet, usd, state, ticker)
+        if fill is None:
+            log.warning(
+                "[PAPER] BUY skipped -- shared paper wallet holds $%.2f, need $%.2f (%s)",
+                wallet.usd, usd, reason,
+            )
+            return
 
     _finalize_buy(state, fill, level, cfg, reason, "BUY", log)
 
@@ -909,7 +918,17 @@ async def check_pending_buy(exchange, state: State, wallet: PaperWallet, cfg: di
     if ask is not None and ask <= pending.limit_price:
         gross   = pending.qty_coin * pending.limit_price
         fee_usd = gross * MAKER_FEE_PCT
-        await wallet.spend(gross)  # debit the limit price worth of USD
+        # Debit gross + fee: _finalize_buy records exactly that as the cost
+        # basis, so anything less leaves the fee counted against PnL but never
+        # paid, and the wallet drifts up by the fee on every fill.
+        if not await wallet.try_spend(gross + fee_usd):
+            log.warning(
+                "[PAPER] LIMIT-BUY fill skipped -- shared paper wallet holds $%.2f, "
+                "need $%.2f; dropping the resting order",
+                wallet.usd, gross + fee_usd,
+            )
+            state.pending_buy_order = None
+            return False
         state.paper_wallet_coin += pending.qty_coin
         fill = {"qty": pending.qty_coin, "price": pending.limit_price,
                 "fee_usd": fee_usd, "ts": _now_iso()}
@@ -1457,7 +1476,13 @@ async def check_pending_sell(exchange, state: State, wallet: PaperWallet, cfg: d
 
         if status == "closed":
             if filled_qty <= 0:
+                # Mirrors the buy side: a real cancel reports canceled/expired,
+                # not closed, so assume it filled -- but say so loudly. If
+                # Kraken ever mislabels a no-fill as closed, this is where a
+                # phantom close books fake PnL and strands the real coins.
                 filled_qty = float(pending.qty_coin)
+                log.warning("LIMIT-SELL %s closed but filled qty missing -- assuming full %.8f",
+                            pending.order_id, filled_qty)
             fill = _sell_fill_from_order(order, pending, filled_qty)
             return await _finalize_sell(state, fill, cfg, "limit-sell filled",
                                         "LIMIT-SELL FILL", log, push_notify,
@@ -1581,7 +1606,34 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
         log.info("MANUAL: %s", "PAUSED" if state.paused else "RESUMED")
         return None
 
+    if cmd.kind == "pause_buys_toggle":
+        # Stops the coin ACCUMULATING while leaving every exit live: sell-trail,
+        # target sell and stop-loss all carry on, so a held position can still
+        # close. Manual force-buy still works as a deliberate one-off.
+        state.buys_paused = not state.buys_paused
+        if state.buys_paused:
+            state.trailing_buy = TrailState()   # a half-formed buy trail must not fire on resume
+            if state.pending_buy_order is not None:
+                log.info("MANUAL: BUYING PAUSED -- cancelling the resting limit buy; sells carry on")
+                return cmd                       # the dispatch cancels it (needs exchange access)
+            log.info("MANUAL: BUYING PAUSED -- no new buys; sells, stop-loss and targets carry on")
+        else:
+            # The entry high went stale while buys were paused (the entry trail
+            # wasn't running); rebuild it from live prices rather than arm off it.
+            if not state.positions:
+                state.initial_entry_high = None
+            log.info("MANUAL: BUYING RESUMED")
+        return None
+
     if cmd.kind == "arm_sell_trail":
+        # A toggle: pressing it while a MANUAL sell-trail is armed disarms it.
+        # Before this a manual trail could not be cancelled at all -- it only
+        # ended by firing or a full reset, and pressing the key again just
+        # re-armed it at the current price.
+        if state.trailing_sell.armed and state.trailing_sell.manual:
+            state.trailing_sell = TrailState()
+            log.info("MANUAL: sell-trail DISARMED (the automatic take-profit trail resumes)")
+            return None
         if not state.positions:
             log.info("MANUAL: arm-sell-trail ignored -- no open positions")
             return None
@@ -1603,6 +1655,11 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
             return None
         if state.pending_sell_order is not None and state.pending_sell_order.manual:
             log.info("MANUAL: arm-buy-trail ignored -- a manual target sell is resting (menu p); clear it first (buys are frozen)")
+            return None
+        if state.buys_paused:
+            # Armed now it would sit inert (the tick loop runs no buy trails
+            # while paused) and then fire the moment buying resumed.
+            log.info("MANUAL: arm-buy-trail ignored -- buying is paused (menu b resumes)")
             return None
         state.trailing_buy = TrailState(armed=True, extreme=current_price, armed_at_price=current_price, manual=True)
         where = "grid add" if state.positions else "initial entry"
@@ -1830,8 +1887,9 @@ async def run_coin(
                         # slot and overrides the automatic entry/grid trails.
                         manual_buy_trail = state.trailing_buy.armed and state.trailing_buy.manual
                         if not state.positions:
-                            # Skip entry trails while a limit buy is resting.
-                            if state.pending_buy_order is None:
+                            # Skip entry trails while a limit buy is resting, or
+                            # while buying is paused.
+                            if state.pending_buy_order is None and not state.buys_paused:
                                 if manual_buy_trail:
                                     action = handle_manual_buy_trail(state, price, cfg, log)
                                 else:
@@ -1851,7 +1909,8 @@ async def run_coin(
                             # Buy side: a manual buy-trail overrides the auto grid
                             # trail (shared trailing_buy slot). Frozen while a limit
                             # buy rests or a manual target sell rests.
-                            if action is None and state.pending_buy_order is None and not manual_target:
+                            if (action is None and state.pending_buy_order is None
+                                    and not manual_target and not state.buys_paused):
                                 if manual_buy_trail:
                                     action = handle_manual_buy_trail(state, price, cfg, log)
                                 else:
@@ -1900,6 +1959,10 @@ async def run_coin(
                         await execute_retire(exchange, state, cfg, log)
                         # PnL moved active -> retired -- refresh Blynk with the new split
                         asyncio.create_task(blynk.push_pnl(states, COINS))
+                    elif action.kind == "pause_buys_toggle":
+                        # Buying was paused with a limit buy resting: cancel it,
+                        # booking any portion that filled before the cancel landed.
+                        await cancel_pending_buy_and_book(exchange, state, cfg, log, "pause buying")
 
                 save_state(symbol, state)
             except ccxt.NetworkError as e:

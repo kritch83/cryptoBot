@@ -49,13 +49,24 @@ from .coin_runner import sell_threshold
 from .config import (
     COINS,
     DASHBOARD_HOST,
+    EXCHANGE_ID,
     DASHBOARD_PORT,
     DASHBOARD_TOKEN,
     MAKER_FEE_PCT,
     PAPER_STARTING_USD,
     TAKER_FEE_PCT,
 )
-from .config_edit import FIELD_SPECS, STRUCTURAL_FIELDS, ConfigEditError, render, set_fields
+from .config_edit import (
+    FIELD_SPECS,
+    NEW_COIN_DEFAULTS,
+    STRUCTURAL_FIELDS,
+    ConfigEditError,
+    add_coin,
+    normalize_symbol,
+    remove_coin,
+    render,
+    set_fields,
+)
 from .config_reload import ReloadPlan, apply_changes, diff_coins, format_value, parse_config_coins
 from .retired import load_retired, total_retired
 from .state import PendingAction, State, load_state
@@ -94,6 +105,8 @@ class DashboardContext:
     last_price: dict                  # symbol -> Optional[float]
     cmd_queues: dict                  # symbol -> asyncio.Queue
     balance_holder: dict              # {"usd", "coins", "ts"} from kraken_balance_refresher
+    exchange: Any = None              # ccxt exchange, for validating a new pair exists
+    spawn_coin: Any = None            # async (cfg) -> note; starts a coin without a restart
     mode: str = "paper"
     dry_run: bool = False
     started_ts: float = field(default_factory=time.time)
@@ -130,6 +143,8 @@ def _trail_dict(trail, price: Optional[float], pct: float, direction: str) -> Op
 
 def _next_buy(state: State, cfg: dict, price: Optional[float]) -> dict:
     """Mirror of conductor.format_stats' 'Next BUY' block, as data."""
+    if state.buys_paused:
+        return {"kind": "buys_paused", "label": "Buying paused"}
     pbo = state.pending_buy_order
     if pbo is not None:
         buffer_pct = max(cfg["trail_buy_pct"], cfg.get("limit_buy_offset_pct", 0.001))
@@ -249,6 +264,7 @@ def _coin_snapshot(ctx: DashboardContext, cfg: dict, index: int) -> dict:
         "initial_entry_high": state.initial_entry_high,
         "breakeven_exit_armed": state.breakeven_exit_armed,
         "pause_after_sell": state.pause_after_sell,
+        "buys_paused": state.buys_paused,
         "stop_loss_pct": state.stop_loss_pct,
         "stop_loss_trigger": stop_trigger,
         "stop_loss_delta_pct": _delta_pct(stop_trigger, price),
@@ -428,6 +444,7 @@ def build_meta() -> dict:
             for key, spec in FIELD_SPECS.items()
         ],
         "value_kinds": sorted(VALUE_KINDS),
+        "new_coin_defaults": {k: render(v) for k, v in NEW_COIN_DEFAULTS.items()},
     }
 
 
@@ -466,7 +483,7 @@ def queue_action(ctx: DashboardContext, symbol: str, kind: str,
             "message": f"queued {kind} for {symbol}"}
 
 
-def apply_config_edit(ctx: DashboardContext, symbol: str, fields: dict) -> dict:
+async def apply_config_edit(ctx: DashboardContext, symbol: str, fields: dict) -> dict:
     """Write a coin's tunables to config.py, then hot-apply them if it's running.
 
     Two phases with different failure modes, reported separately: the file write
@@ -510,8 +527,25 @@ def apply_config_edit(ctx: DashboardContext, symbol: str, fields: dict) -> dict:
             if skipped:
                 notes.append("restart required for: " + ", ".join(skipped))
 
+    # Enabling a coin used to mean "edit the file, then restart". Now it can
+    # start straight away, using the same path as "+ Add coin".
+    started = False
+    if any(e.key == "enabled" and e.new for e in edits) and symbol not in ctx.states:
+        parsed = next((c for c in parse_config_coins() if c["symbol"] == symbol), None)
+        if parsed is not None:
+            entry = register_entry(parsed)
+            started, start_notes = await _maybe_start(ctx, entry)
+            notes.extend(start_notes)
+            if started:
+                # Drop the "restart to start it" advice this function added
+                # before we knew we could just start it.
+                notes = [n for n in notes
+                         if "restart required for" not in n
+                         and "restart to start it" not in n]
+
     return {"ok": True, "symbol": symbol, "edits": detail, "applied_live": applied,
-            "notes": notes, "backup": str(backup) if backup else None}
+            "started": started, "notes": notes,
+            "backup": str(backup) if backup else None}
 
 
 def reload_preview(ctx: DashboardContext) -> dict:
@@ -555,6 +589,162 @@ def reload_apply(ctx: DashboardContext, plan_id: str) -> dict:
     logging.info("CONFIG RELOAD applied from dashboard -- %d coin(s) re-tuned", len(plan.changes))
     return {"ok": True, "applied": lines,
             "message": f"applied changes to {len(plan.changes)} coin(s)"}
+
+
+async def add_coin_api(ctx: DashboardContext, symbol: str, fields: Optional[dict]) -> dict:
+    """Append a new pair to COINS in config.py.
+
+    File-only by design: the set of running coin tasks is fixed at startup, so
+    a new pair cannot be hot-applied and the caller is told a restart is needed.
+    The entry is written DISABLED, so even that restart won't start trading it
+    until you look at the numbers and turn it on.
+    """
+    try:
+        symbol = normalize_symbol(symbol)
+    except ConfigEditError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    # If the exchange's markets are loaded, refuse a pair it doesn't list --
+    # otherwise the mistake only surfaces as a stream error after a restart.
+    markets = getattr(ctx.exchange, "markets", None) or {}
+    if markets and symbol not in markets:
+        base = symbol.split("/")[0]
+        alts = sorted(m for m in markets if m.split("/")[0] == base)
+        hint = f" Pairs for {base}: {', '.join(alts[:6])}." if alts else ""
+        return {"ok": False,
+                "error": f"{EXCHANGE_ID} does not list {symbol}.{hint}"}
+
+    try:
+        entry, backup = add_coin(symbol, fields or {})
+    except ConfigEditError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        logging.error("DASHBOARD: add coin %s failed: %s", symbol, exc)
+        return {"ok": False, "error": f"could not edit config.py: {exc}"}
+
+    entry = register_entry(entry)      # visible to the dashboard right away
+    started, notes = await _maybe_start(ctx, entry)
+    if not started:
+        notes.append(f"{symbol} was added DISABLED -- set Enabled to True to start it.")
+    logging.warning("DASHBOARD: added %s to COINS (%s)", symbol,
+                    "started" if started else "disabled")
+    return {"ok": True, "symbol": symbol, "started": started,
+            "entry": {k: render(v) for k, v in entry.items()},
+            "backup": str(backup) if backup else None, "notes": notes}
+
+
+def register_entry(entry: dict) -> dict:
+    """Put a coin into the in-memory COINS list, replacing any same-symbol entry.
+
+    The snapshot builds its inactive list from COINS, so without this a coin
+    added while the bot is running would be written to config.py and then be
+    invisible until a restart -- including invisible to the toggle that would
+    enable it. Returns the object now held in COINS, so callers share one dict
+    per symbol rather than accumulating copies.
+    """
+    for i, existing in enumerate(COINS):
+        if existing.get("symbol") == entry["symbol"]:
+            if existing is entry:
+                return existing
+            COINS[i] = entry
+            return entry
+    COINS.append(entry)
+    return entry
+
+
+def unregister_entry(symbol: str) -> None:
+    """Drop a coin from the in-memory COINS list."""
+    for i, existing in enumerate(COINS):
+        if existing.get("symbol") == symbol:
+            del COINS[i]
+            return
+
+
+async def _maybe_start(ctx: DashboardContext, entry: dict) -> tuple[bool, list]:
+    """Start a coin now if it is enabled and not already running.
+
+    This is what makes adding or enabling a coin take effect without a restart:
+    conductor.spawn_coin does exactly what the startup path does for one coin
+    (state file, queue, price slot, live reconcile, task) and registers it with
+    the same supervision. Failure here is never fatal -- the config.py edit has
+    already landed, so the worst case degrades to the old behaviour: restart.
+    """
+    symbol = entry["symbol"]
+    if not entry.get("enabled", False):
+        return False, []
+    if ctx.spawn_coin is None:
+        return False, [f"{symbol} is enabled but this build cannot start a coin "
+                       f"without a restart."]
+    if symbol in ctx.states:
+        return False, [f"{symbol} is already running."]
+    try:
+        note = await ctx.spawn_coin(entry)
+    except Exception as exc:
+        logging.error("DASHBOARD: could not start %s: %s", symbol, exc)
+        return False, [f"{symbol} was saved to config.py but could not be started "
+                       f"({exc}) -- restart the bot to pick it up."]
+    return True, [note]
+
+
+def remove_coin_api(ctx: DashboardContext, symbol: str, force: bool = False) -> dict:
+    """Delete a pair's entry from COINS in config.py.
+
+    Refuses by default on anything that would lose track of real money: an open
+    position (the coins stay on the exchange, unmanaged), a resting order, or
+    realized PnL that was never booked to the retired ledger and would simply
+    vanish from the totals. RETIRE handles all three properly, which is why the
+    error points at it. `force` overrides -- the UI makes the user type the
+    ticker for that.
+
+    The state file and the retired ledger row are left on disk either way:
+    removing a config entry is an edit, not a decision to destroy history.
+    """
+    try:
+        symbol = normalize_symbol(symbol)
+    except ConfigEditError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    running = symbol in ctx.states
+    state = ctx.states.get(symbol) or _inactive_state(symbol)
+    base = symbol.split("/")[0]
+
+    blockers = []
+    if state is not None:
+        if state.positions or state.total_qty_coin > 0:
+            blockers.append(f"holds {state.total_qty_coin:.8f} {base} across "
+                            f"{len(state.positions)} level(s) -- they stay on the exchange, "
+                            f"untracked")
+        if state.pending_buy_order is not None or state.pending_sell_order is not None:
+            blockers.append("has a resting order that would be orphaned")
+        if state.realized_pnl_usd and symbol not in load_retired():
+            blockers.append(f"has {state.realized_pnl_usd:+,.2f} realized PnL that was never "
+                            f"booked to the retired ledger -- it would disappear from the totals")
+
+    if blockers and not force:
+        return {"ok": False, "blockers": blockers, "can_force": True,
+                "error": f"{symbol} still {'; '.join(blockers)}. Retire it first (that books "
+                         f"the PnL and clears the position), or confirm removing it anyway."}
+
+    try:
+        removed, backup = remove_coin(symbol)
+    except ConfigEditError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        logging.error("DASHBOARD: remove coin %s failed: %s", symbol, exc)
+        return {"ok": False, "error": f"could not edit config.py: {exc}"}
+
+    notes = [f"data/state_{sym_key(symbol)}.json was left on disk; delete it by hand if you "
+             f"want the history gone."]
+    if not running:
+        unregister_entry(symbol)       # a running coin keeps its slot until restart
+    if running:
+        notes.insert(0, f"{symbol} is still RUNNING -- it keeps trading until the bot is "
+                        f"restarted. Pause it now if that matters.")
+    logging.warning("DASHBOARD: removed %s from COINS%s", symbol,
+                    " (still running until restart)" if running else "")
+    return {"ok": True, "symbol": symbol, "was_running": running, "forced": bool(blockers),
+            "removed": {k: render(v) for k, v in removed.items()},
+            "backup": str(backup) if backup else None, "notes": notes}
 
 
 # --- HTTP -------------------------------------------------------------------
@@ -691,7 +881,20 @@ def _make_app(ctx: DashboardContext):
         fields = body.get("fields")
         if not isinstance(fields, dict) or not fields:
             return web.json_response({"ok": False, "error": "no fields supplied"}, status=400)
-        result = apply_config_edit(ctx, symbol, fields)
+        result = await apply_config_edit(ctx, symbol, fields)
+        return web.json_response(result, status=200 if result["ok"] else 400)
+
+    @routes.post("/api/coins")
+    async def coin_add(request):
+        body = await _json_body(request)
+        result = await add_coin_api(ctx, str(body.get("symbol", "")), body.get("fields") or {})
+        return web.json_response(result, status=200 if result["ok"] else 400)
+
+    @routes.post("/api/coins/{key}/remove")
+    async def coin_remove(request):
+        body = await _json_body(request) if request.can_read_body else {}
+        symbol = request.match_info["key"].replace("_", "/")
+        result = remove_coin_api(ctx, symbol, bool(body.get("force")))
         return web.json_response(result, status=200 if result["ok"] else 400)
 
     @routes.get("/api/config/preview")

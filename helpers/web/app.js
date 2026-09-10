@@ -156,7 +156,13 @@ async function api(path, opts = {}) {
   if (res.status === 401) {
     throw new Error('Token rejected — reload with ?token=YOUR_TOKEN');
   }
-  if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
+  if (!res.ok) {
+    // Keep the server's structured refusal (why it said no, whether it can be
+    // forced) on the error -- the remove-coin flow needs it, not just a string.
+    const err = new Error((data && data.error) || `HTTP ${res.status}`);
+    if (data) { err.blockers = data.blockers || []; err.canForce = !!data.can_force; }
+    throw err;
+  }
   return data;
 }
 
@@ -184,6 +190,7 @@ function modal(opts) {
   box.innerHTML = `<h3>${esc(opts.title)}</h3>` +
     (opts.warn ? `<div class="warn-box">${opts.warn}</div>` : '') +
     (opts.html || '');
+  if (opts.node) box.appendChild(opts.node);
 
   let input = null;
   if (opts.typeToConfirm) {
@@ -199,7 +206,11 @@ function modal(opts) {
   const foot = el('div', 'modal-foot');
   const cancel = el('button', '', 'Cancel');
   const go = el('button', opts.danger ? 'danger' : 'primary', opts.confirmLabel || 'Confirm');
-  cancel.onclick = closeModal;
+  // Dismiss only THIS dialog, not the whole root: a handler is allowed to open
+  // a follow-up modal (the remove-coin flow opens one when the server refuses),
+  // and clearing the root would wipe it the moment onConfirm resolved.
+  const dismiss = () => { if (back.isConnected) back.remove(); };
+  cancel.onclick = dismiss;
   if (input) {
     go.disabled = true;
     input.oninput = () => { go.disabled = input.value.trim().toUpperCase() !== opts.typeToConfirm; };
@@ -208,13 +219,12 @@ function modal(opts) {
   go.onclick = async () => {
     go.disabled = true;
     go.textContent = 'Working…';
-    try { await opts.onConfirm(); } finally { closeModal(); }
+    try { await opts.onConfirm(); } finally { dismiss(); }
   };
   foot.append(cancel, go);
   box.appendChild(foot);
   back.appendChild(box);
-  back.onclick = (e) => { if (e.target === back) closeModal(); };
-  $('#modal-root').innerHTML = '';
+  back.onclick = (e) => { if (e.target === back) dismiss(); };
   $('#modal-root').appendChild(back);
   (input || go).focus();
 }
@@ -232,7 +242,9 @@ function actionCopy(kind, coin) {
         title: `Force BUY ${coin.symbol}`, danger: true, confirmLabel: 'Buy at market',
         warn: `Places an immediate <b>market buy</b> of ${usd(coin.config.usd_per_buy)} ` +
               `at level ${coin.levels}, ignoring the grid trigger.`,
-        html: `<p class="small muted">A pending limit buy, if any, is cancelled first. ` +
+        html: (coin.buys_paused ? `<p><b>Buying is paused</b> — this is a one-off manual ` +
+               `buy; it does not resume automatic buying.</p>` : '') +
+              `<p class="small muted">A pending limit buy, if any, is cancelled first. ` +
               `Currently ${held}.</p>`,
       };
     case 'sell_all':
@@ -271,7 +283,24 @@ function actionCopy(kind, coin) {
         : { title: `Pause ${coin.symbol}`, confirmLabel: 'Pause',
             html: `<p>No new buys or sells. Resting limit orders are still serviced ` +
                   `and stop-loss is skipped while paused.</p>` };
+    case 'pause_buys_toggle':
+      return coin.buys_paused
+        ? { title: `Resume buying on ${coin.symbol}`, confirmLabel: 'Resume buying',
+            html: `<p>The coin goes back to opening grid levels on its own.` +
+                  (coin.levels ? '' : ' The first-buy reference restarts from the current price.') +
+                  `</p>` }
+        : { title: `Pause buying on ${coin.symbol}`, confirmLabel: 'Pause buying',
+            html: `<p>No new buys — automatic or trail-fired. Selling, the stop-loss and any ` +
+                  `target sell carry on, so the coin can still exit its position.</p>` +
+                  (coin.next_buy.kind === 'limit'
+                    ? `<p class="small muted">The resting limit buy is cancelled.</p>` : '') +
+                  `<p class="small muted">"Force BUY now" still works as a one-off.</p>` };
     case 'arm_sell_trail':
+      if (coin.trailing_sell?.armed && coin.trailing_sell.manual) {
+        return { title: `Disarm sell-trail on ${coin.symbol}`, confirmLabel: 'Disarm',
+          html: `<p>Cancels the manual trailing stop. The automatic take-profit trail ` +
+                `takes over again from the next tick.</p>` };
+      }
       return { title: `Arm sell-trail on ${coin.symbol}`, confirmLabel: 'Arm',
         html: `<p>Arms a manual trailing stop at ${price(coin.price, coin.price_prec)}, ` +
               `trailing ${pct(coin.config.trail_sell_pct * 100, 3)} off the high. Floored at ` +
@@ -394,9 +423,8 @@ async function saveConfig(symbol, fields) {
     const changed = res.edits.map((e) => `${e.key}: ${e.old} → ${e.new}`).join('\n');
     toast(`${symbol}: config.py saved`,
           changed + (res.notes.length ? '\n' + res.notes.join('\n') : ''), 'ok', 11000);
-    if (res.notes.length) {
-      toast(`${symbol}: restart needed`, res.notes.join('\n'), 'info', 12000);
-    }
+    if (res.started) toast(`${symbol} is now running`, res.notes.join('\n'), 'ok', 14000);
+    else if (res.notes.length) toast(`${symbol}: heads up`, res.notes.join('\n'), 'info', 12000);
     // Rebuild the panel so the form reflects what config.py now holds.
     S.nodes.delete('detail:' + symbol);
     S.nodes.delete('idetail:' + symbol);
@@ -501,7 +529,8 @@ function badges(coin) {
   const nb = coin.next_buy, ns = coin.next_sell;
   if (nb.kind === 'limit') out.push(['info', `BUY LIMIT ${price(nb.price, p)}`]);
   else if (nb.kind === 'trail') out.push(['info', `BUY-TRAIL${nb.manual ? ' MAN' : ''} →${price(nb.price, p)}`]);
-  else if (nb.kind === 'grid_full') out.push(['plain', 'GRID FULL']);
+  else if (nb.kind === 'grid_full') out.push(['bad', 'GRID FULL']);
+  else if (nb.kind === 'buys_paused') out.push(['warn', 'BUYS PAUSED']);
   if (ns.kind === 'target') out.push(['good', `TARGET ${price(ns.price, p)}`]);
   else if (ns.kind === 'limit') out.push(['good', `SELL LIMIT ${price(ns.price, p)}`]);
   else if (ns.kind === 'trail') out.push(['good', `SELL-TRAIL${ns.manual ? ' MAN' : ''} →${price(ns.price, p)}`]);
@@ -527,7 +556,9 @@ function nextCell(coin) {
         ? '' : ` <span class="muted num">${esc(pct(block.delta_pct, 2))}</span>`);
     return d;
   };
-  wrap.appendChild(line('buy', coin.next_buy, 'pos'));
+  const buyColor = coin.next_buy.kind === 'grid_full' ? 'neg'
+    : coin.next_buy.kind === 'buys_paused' ? 'warn-text' : 'pos';
+  wrap.appendChild(line('buy', coin.next_buy, buyColor));
   wrap.appendChild(line('sell', coin.next_sell, 'neg'));
   return wrap;
 }
@@ -906,13 +937,80 @@ function updateDetail(dtr, coin) {
   }
   fillKv(dtr, 'next', ['Buy', ...buyRows, 'Sell', ...sellRows]);
 
-  const pauseBtn = dtr.querySelector('[data-action="pause_toggle"]');
-  if (pauseBtn) pauseBtn.textContent = coin.paused ? 'Resume' : 'Pause';
+  // Toggles relabel and light up live, without rebuilding the controls.
+  for (const btn of dtr.querySelectorAll('.control-group button[data-action]')) {
+    const action = S.meta.actions.find((a) => a.kind === btn.dataset.action);
+    if (action) paintControl(btn, coin, action);
+  }
 
   const positions = dtr.querySelector('.detail-positions');
   if (positions) {
     positions.replaceChildren(...(coin.positions.length ? [positionsBlock(coin)] : []));
   }
+}
+
+/* Controls, grouped by what they act on. Toggles show their state (lit when on)
+   and relabel live on every poll; one-shots are plain; anything that moves money
+   or wipes state is red. */
+const CONTROL_GROUPS = [
+  { title: 'Run state', kinds: ['pause_toggle', 'pause_buys_toggle', 'arm_pause_after_sell',
+                                'arm_breakeven_exit'] },
+  { title: 'Buy',   kinds: ['arm_buy_trail', 'buy'] },
+  { title: 'Sell',  kinds: ['arm_sell_trail', 'sell_all'],
+    values: ['set_target_sell', 'set_stop_loss'] },
+  { title: 'Reset', kinds: ['clear_targets', 'clear_stats', 'retire'] },
+];
+
+const CONTROL_LABELS = {
+  buy: 'Force BUY now', sell_all: 'Sell ALL now', clear_targets: 'Clear targets',
+  clear_stats: 'Clear stats', retire: 'Retire coin',
+};
+
+/* Live label and on/off for each toggle, from the latest snapshot. */
+function controlState(coin, kind) {
+  switch (kind) {
+    case 'pause_toggle':
+      return { label: coin.paused ? 'Resume trading' : 'Pause trading', on: coin.paused };
+    case 'pause_buys_toggle':
+      return { label: coin.buys_paused ? 'Resume buying' : 'Pause buying', on: coin.buys_paused };
+    case 'arm_pause_after_sell':
+      return { label: 'Pause after sell', on: coin.pause_after_sell };
+    case 'arm_breakeven_exit':
+      return { label: 'Breakeven exit', on: coin.breakeven_exit_armed };
+    case 'arm_sell_trail': {
+      const on = !!(coin.trailing_sell?.armed && coin.trailing_sell.manual);
+      return { label: on ? 'Disarm sell-trail' : 'Arm sell-trail', on };
+    }
+    case 'arm_buy_trail':
+      return { label: 'Arm buy-trail', on: !!(coin.trailing_buy?.armed && coin.trailing_buy.manual) };
+    default:
+      return null;
+  }
+}
+
+function paintControl(btn, coin, action) {
+  const st = controlState(coin, action.kind);
+  const label = st ? st.label : (CONTROL_LABELS[action.kind] || action.short);
+  if (btn.textContent !== label) btn.textContent = label;
+  btn.classList.toggle('toggle', !!st);
+  btn.classList.toggle('on', !!(st && st.on));
+  // A buy-trail armed while buying is paused would sit idle and then fire the
+  // moment buying resumed; the bot refuses it, so don't offer it here either.
+  const blocked = action.kind === 'arm_buy_trail' && coin.buys_paused;
+  btn.disabled = blocked;
+  btn.title = blocked ? 'Buying is paused — resume buying to arm a buy-trail'
+                      : `${action.label} (menu key ${action.key})`;
+}
+
+function controlButton(coin, action) {
+  const btn = el('button', action.danger ? 'danger' : '');
+  btn.dataset.action = action.kind;
+  paintControl(btn, coin, action);          // sets label, toggle state and title
+  btn.onclick = () => {
+    const fresh = coinBySymbol(coin.symbol) || coin;
+    modal({ ...actionCopy(action.kind, fresh), onConfirm: () => runAction(coin.symbol, action.kind) });
+  };
+  return btn;
 }
 
 function actionsBlock(coin) {
@@ -921,28 +1019,36 @@ function actionsBlock(coin) {
   // you open a coin. The choice is remembered, so collapsing it sticks.
   const { body } = disclosure('Controls', 'controlsOpen', true);
   block.appendChild(body.parentElement);
-  const row = el('div', 'actions');
+  const byKind = new Map(S.meta.actions.map((a) => [a.kind, a]));
 
-  for (const a of S.meta.actions) {
-    if (a.local || a.takes_value) continue;
-    const label = a.kind === 'pause_toggle' ? (coin.paused ? 'Resume' : 'Pause') : a.short;
-    const btn = el('button', a.danger ? 'danger' : '', label);
-    btn.dataset.action = a.kind;
-    btn.title = `${a.label} (menu key ${a.key})`;
-    btn.onclick = () => {
-      const copy = actionCopy(a.kind, coinBySymbol(coin.symbol) || coin);
-      modal({ ...copy, onConfirm: () => runAction(coin.symbol, a.kind) });
-    };
-    row.appendChild(btn);
+  // Anything in the catalog that isn't placed below still gets a button, so a
+  // new action can never silently go missing from the dashboard.
+  const placed = new Set(CONTROL_GROUPS.flatMap((g) => [...g.kinds, ...(g.values || [])]));
+  const extras = S.meta.actions.filter((a) => !a.local && !a.takes_value && !placed.has(a.kind));
+  const groups = extras.length
+    ? [...CONTROL_GROUPS, { title: 'Other', kinds: extras.map((a) => a.kind) }] : CONTROL_GROUPS;
+
+  for (const group of groups) {
+    const section = el('div', 'control-group');
+    section.appendChild(el('div', 'control-group-title', group.title));
+    const row = el('div', 'actions');
+    for (const kind of group.kinds) {
+      if (byKind.has(kind)) row.appendChild(controlButton(coin, byKind.get(kind)));
+    }
+    section.appendChild(row);
+    for (const kind of group.values || []) {
+      if (kind === 'set_target_sell') {
+        section.appendChild(valueRow(coin, kind, 'Target sell $',
+          coin.next_sell.kind === 'target' ? String(coin.next_sell.price) : '',
+          'price', 'post-only limit for the whole position · above market · 0 clears'));
+      } else if (kind === 'set_stop_loss') {
+        section.appendChild(valueRow(coin, kind, 'Stop-loss %',
+          coin.stop_loss_pct ? (coin.stop_loss_pct * 100).toFixed(2) : '',
+          'e.g. 8', '% below avg entry · market-sells all + pauses · 0 clears'));
+      }
+    }
+    body.appendChild(section);
   }
-  body.appendChild(row);
-
-  body.appendChild(valueRow(coin, 'set_stop_loss', 'Stop-loss %',
-    coin.stop_loss_pct ? (coin.stop_loss_pct * 100).toFixed(2) : '',
-    'e.g. 8', '% below avg entry · 0 clears'));
-  body.appendChild(valueRow(coin, 'set_target_sell', 'Target sell $',
-    coin.next_sell.kind === 'target' ? String(coin.next_sell.price) : '',
-    'price', 'must be above market · 0 clears'));
   return block;
 }
 
@@ -1019,7 +1125,9 @@ function configBlock(coin) {
       const current = raw !== undefined ? raw
         : (coin.config?.[spec.key] === undefined ? '' : String(coin.config[spec.key]));
       const field = el('div', 'field');
-      const lab = el('label', null, spec.label + (spec.structural ? ' (restart)' : ''));
+      const restartTag = spec.key === 'enabled' ? ' (off needs restart)'
+        : spec.structural ? ' (restart)' : '';
+      const lab = el('label', null, spec.label + restartTag);
       field.appendChild(lab);
 
       let input;
@@ -1084,8 +1192,10 @@ function configBlock(coin) {
       title: `Save ${keys.length} change(s) to ${coin.symbol}`,
       confirmLabel: 'Write config.py',
       warn: structural.length
-        ? `<b>${structural.join(', ')}</b> ${structural.length > 1 ? 'are' : 'is'} structural — ` +
-          `written to the file now, but only takes effect when the bot restarts.`
+        ? (structural.includes('enabled') && changes.enabled === true
+            ? `Turning <b>enabled</b> on starts this coin trading <b>immediately</b>.`
+            : `<b>${structural.join(', ')}</b> ${structural.length > 1 ? 'are' : 'is'} ` +
+              `structural — written to the file now, but only takes effect on restart.`)
         : null,
       html: '<p class="small">' + keys.map((k) =>
         `<code>${esc(k)}</code>: ${esc(inputs.get(k).initial)} → <b>${esc(String(changes[k]))}</b>`)
@@ -1095,7 +1205,10 @@ function configBlock(coin) {
       onConfirm: () => saveConfig(coin.symbol, changes),
     });
   };
-  foot.append(save, reset, status);
+  const remove = el('button', 'danger', 'Remove coin');
+  remove.title = `Delete ${coin.symbol} from COINS in helpers/config.py`;
+  remove.onclick = () => removeCoinFlow(coin);
+  foot.append(save, reset, remove, status);
   body.append(foot, form);
   return block;
 }
@@ -1360,6 +1473,127 @@ async function fetchIcons() {
   }
 }
 
+/* Form for a new pair. Values are pre-filled from the server's own defaults so
+   the dashboard never invents numbers the bot doesn't agree with. */
+function newCoinForm() {
+  const wrap = el('div');
+  const symField = el('div', 'field');
+  symField.appendChild(el('label', null, 'Pair'));
+  const sym = el('input');
+  sym.type = 'text';
+  sym.placeholder = 'SOL/USD';
+  sym.autocapitalize = 'characters';
+  sym.spellcheck = false;
+  symField.append(sym, Object.assign(el('div', 'hint'),
+    { textContent: 'BASE/QUOTE, exactly as the exchange lists it.' }));
+  wrap.appendChild(symField);
+
+  const inputs = new Map();
+  for (const group of ['general', 'buy', 'sell']) {
+    const fields = S.meta.fields.filter((f) => f.group === group && f.key !== 'blynk_pin');
+    if (!fields.length) continue;
+    wrap.appendChild(Object.assign(el('div', 'small dim'),
+      { textContent: group.toUpperCase(), style: 'margin:12px 0 6px;letter-spacing:.08em' }));
+    const grid = el('div', 'form-grid');
+    for (const spec of fields) {
+      const initial = (S.meta.new_coin_defaults || {})[spec.key] ?? '';
+      const field = el('div', 'field');
+      field.appendChild(el('label', null, spec.label));
+      let input;
+      if (spec.kind === 'choice' || spec.kind === 'bool') {
+        input = el('select');
+        for (const opt of (spec.kind === 'bool' ? ['True', 'False'] : spec.choices)) {
+          const o = el('option', null, opt);
+          o.value = opt;
+          input.appendChild(o);
+        }
+        input.value = String(initial).replace(/"/g, '') || (spec.kind === 'bool' ? 'False' : spec.choices[0]);
+      } else {
+        input = el('input');
+        input.type = 'text';
+        input.inputMode = 'decimal';
+        input.value = String(initial).replace(/"/g, '');
+      }
+      field.appendChild(input);
+      const hint = el('div', 'hint' + (spec.as_pct ? ' pcthint' : ''));
+      hint.textContent = spec.as_pct ? pctHint(input.value, spec) : spec.hint;
+      if (spec.as_pct) input.oninput = () => { hint.textContent = pctHint(input.value, spec); };
+      field.appendChild(hint);
+      inputs.set(spec.key, { input, spec });
+      grid.appendChild(field);
+    }
+    wrap.appendChild(grid);
+  }
+  return { wrap, sym, inputs };
+}
+
+function addCoinFlow() {
+  const { wrap, sym, inputs } = newCoinForm();
+  modal({
+    title: 'Add a coin',
+    confirmLabel: 'Write to config.py',
+    warn: 'Defaults to <b>disabled</b> so you can check the numbers first. Set Enabled ' +
+          'to True and it starts trading <b>immediately</b> — no restart.',
+    node: wrap,
+    onConfirm: async () => {
+      const fields = {};
+      for (const [key, { input, spec }] of inputs) {
+        fields[key] = spec.kind === 'bool' ? input.value === 'True' : input.value.trim();
+      }
+      try {
+        const res = await post('/api/coins', { symbol: sym.value, fields });
+        toast(res.started ? `${res.symbol} added and trading` : `${res.symbol} added to config.py`,
+              res.notes.join('\n'), 'ok', 15000);
+        S.nodes.clear();
+        refresh();
+      } catch (err) {
+        toast('Coin not added', err.message, 'err', 14000);
+      }
+    },
+  });
+  sym.focus();
+}
+
+function removeCoinFlow(coin) {
+  const send = async (force) => {
+    try {
+      const res = await post(`/api/coins/${coin.key}/remove`, { force });
+      toast(`${res.symbol} removed from config.py`, res.notes.join('\n'), 'ok', 16000);
+      S.open = S.open === coin.symbol ? null : S.open;
+      S.openInactive = S.openInactive === coin.symbol ? null : S.openInactive;
+      S.nodes.clear();
+      refresh();
+    } catch (err) {
+      // The server refuses by default on anything that would lose track of real
+      // money, and says why. Force needs the ticker typed out.
+      const blockers = err.blockers || [];
+      if (!err.canForce) { toast('Coin not removed', err.message, 'err', 15000); return; }
+      modal({
+        title: `Remove ${coin.symbol} anyway?`,
+        danger: true, confirmLabel: 'Remove from config.py',
+        typeToConfirm: coin.base,
+        warn: `<b>${esc(coin.symbol)} still:</b><br>` +
+              blockers.map((b) => '• ' + esc(b)).join('<br>') +
+              `<br><br><b>Retire the coin first</b> if you want its PnL kept and its ` +
+              `position cleared properly.`,
+        html: `<p class="small muted">The state file is left on disk either way.</p>`,
+        onConfirm: () => send(true),
+      });
+    }
+  };
+
+  modal({
+    title: `Remove ${coin.symbol} from config.py`,
+    danger: true, confirmLabel: 'Remove',
+    warn: 'Deletes the pair\'s entry from <code>COINS</code>. It disappears from the ' +
+          'dashboard entirely — including its realized PnL, unless that was booked to the ' +
+          'retired ledger.',
+    html: `<p class="small muted">The bot keeps trading it until the next restart. Its ` +
+          `state file and any retired-ledger row are left alone.</p>`,
+    onConfirm: () => send(false),
+  });
+}
+
 async function configReloadFlow() {
   let preview;
   try {
@@ -1401,6 +1635,7 @@ async function boot() {
 
   $('#btn-reload-config').onclick = configReloadFlow;
   $('#btn-icons').onclick = fetchIcons;
+  $('#btn-add-coin').onclick = addCoinFlow;
   $('#btn-pause-poll').onclick = (e) => {
     S.polling = !S.polling;
     e.target.textContent = S.polling ? 'Pause refresh' : 'Resume refresh';

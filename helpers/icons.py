@@ -91,7 +91,8 @@ def have_icons(bases: Iterable[str]) -> dict:
 def content_type(path: Path) -> str:
     """Sniff the stored file rather than trusting its extension."""
     try:
-        head = path.open("rb").read(12)
+        with path.open("rb") as handle:
+            head = handle.read(12)
     except OSError:
         return "application/octet-stream"
     for magic, _ext, mime in _MAGIC:

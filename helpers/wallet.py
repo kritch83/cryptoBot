@@ -24,10 +24,21 @@ class PaperWallet:
     def usd(self) -> float:
         return self._usd
 
-    async def spend(self, amount: float) -> None:
+    async def try_spend(self, amount: float) -> bool:
+        """Debit `amount` only if the pool can cover it; False if it can't.
+
+        Replaces an unconditional spend(): without a check the shared paper
+        pool went negative and the strategy was never capital-constrained the
+        way it is live, which made every paper figure derived from it fiction.
+        The check and the debit happen under the same lock, so two coins buying
+        on the same tick cannot both pass the check and overdraw.
+        """
         async with self._lock:
+            if amount > self._usd:
+                return False
             self._usd -= amount
             self._save_locked()
+            return True
 
     async def credit(self, amount: float) -> None:
         async with self._lock:

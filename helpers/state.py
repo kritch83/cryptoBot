@@ -86,6 +86,7 @@ class State:
     paused: bool = False
     breakeven_exit_armed: bool = False
     pause_after_sell: bool = False
+    buys_paused: bool = False            # no new buys (auto or trail-fired); selling carries on
     stop_loss_pct: Optional[float] = None   # hard stop: fraction below avg entry (0.10 = -10%); None = off
     trailing_buy: TrailState = field(default_factory=TrailState)
     trailing_sell: TrailState = field(default_factory=TrailState)

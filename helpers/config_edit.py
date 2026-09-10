@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -59,7 +60,7 @@ class FieldSpec(NamedTuple):
 FIELD_SPECS: dict[str, FieldSpec] = {
     "enabled": FieldSpec(
         "bool", "Enabled",
-        "Structural: a restart is required to start or stop the coin's task.",
+        "Turning it on starts the coin immediately; turning it off needs a restart.",
         structural=True, group="general"),
     "price_prec": FieldSpec(
         "int", "Price precision", "Decimals used to display this pair's price.",
@@ -213,8 +214,8 @@ def _span(starts: list[int], node: ast.AST) -> tuple[int, int]:
             starts[node.end_lineno] + node.end_col_offset)
 
 
-def _find_coin_dict(tree: ast.Module, symbol: str) -> ast.Dict:
-    """The ast.Dict for `symbol` inside the top-level COINS list."""
+def _find_coins_list(tree: ast.Module) -> ast.List:
+    """The top-level `COINS = [...]` list literal."""
     coins_node = None
     for node in tree.body:
         targets = node.targets if isinstance(node, ast.Assign) else []
@@ -222,6 +223,12 @@ def _find_coin_dict(tree: ast.Module, symbol: str) -> ast.Dict:
             coins_node = node.value
     if not isinstance(coins_node, ast.List):
         raise ConfigEditError("COINS is missing or is not a plain list literal in config.py")
+    return coins_node
+
+
+def _find_coin_dict(tree: ast.Module, symbol: str) -> ast.Dict:
+    """The ast.Dict for `symbol` inside the top-level COINS list."""
+    coins_node = _find_coins_list(tree)
 
     for element in coins_node.elts:
         if not isinstance(element, ast.Dict):
@@ -349,18 +356,204 @@ def set_fields(symbol: str, updates: dict, path: str | Path = DEFAULT_CONFIG_PAT
         starts = _line_starts(new_data)
         coin_node = _find_coin_dict(tree, symbol)
 
-    # Validate the candidate as a real config before it can become config.py.
+    # One definition of "how config.py is safely replaced", shared with
+    # add_coin/remove_coin -- see _commit().
+    _commit(path, new_data,
+            lambda coins: _check_present(coins, symbol, {e.key: e.new for e in edits}))
+    return edits, _last_backup
+
+
+# --- adding and removing whole coins ----------------------------------------
+
+# A pair as Kraken/ccxt spells it: BASE/QUOTE, upper case.
+SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,15}/[A-Z0-9]{2,10}$")
+
+# Column the values line up on in the later COINS entries: 8 spaces of indent
+# plus the longest key ("limit_sell_offset_pct":) padded to 24.
+_KEY_WIDTH = 24
+_INDENT = " " * 8            # keys
+_BRACE_INDENT = " " * 4      # the { } of each entry
+
+# Starting point for a new coin. Deliberately conservative, and deliberately
+# DISABLED: adding a pair needs a restart anyway, so the safe order is add it,
+# look at the numbers, then enable it. Nothing here starts spending money on
+# its own.
+NEW_COIN_DEFAULTS = {
+    "price_prec":             4,
+    "drop_pct":               0.02,
+    "trail_buy_pct":          0.005,
+    "trail_sell_pct":         0.005,
+    "buy_order_type":         "limit",
+    "limit_buy_offset_pct":   0.001,
+    "order_type":             "limit",
+    "limit_sell_offset_pct":  0.001,
+    "take_profit_pct":        0.04,
+    "usd_per_buy":            100.0,
+    "max_grid_levels":        14,
+    "enabled":                False,
+}
+
+# Order keys are written in, matching the existing hand-written entries.
+_KEY_ORDER = (
+    "symbol", "price_prec", "drop_pct", "trail_buy_pct", "trail_sell_pct",
+    "buy_order_type", "limit_buy_offset_pct", "order_type", "limit_sell_offset_pct",
+    "take_profit_pct", "usd_per_buy", "max_grid_levels", "enabled", "blynk_pin",
+)
+
+
+def normalize_symbol(raw: str) -> str:
+    """Upper-case and validate a pair. Raises ConfigEditError on anything odd."""
+    symbol = str(raw or "").strip().upper().replace("\\", "/")
+    if "/" not in symbol:
+        raise ConfigEditError(f"{raw!r} is not a pair -- write it as BASE/QUOTE, e.g. SOL/USD")
+    if not SYMBOL_RE.match(symbol):
+        raise ConfigEditError(f"{raw!r} is not a valid pair name (expected BASE/QUOTE, e.g. SOL/USD)")
+    return symbol
+
+
+def next_blynk_pin(coins: list) -> Optional[str]:
+    """Lowest unused V-pin, so a new coin doesn't collide with an existing one.
+
+    V0 is reserved for the all-coins total (BLYNK_TOTAL_PNL_PIN).
+    """
+    used = set()
+    for entry in coins:
+        pin = str(entry.get("blynk_pin") or "")
+        if pin[:1].upper() == "V" and pin[1:].isdigit():
+            used.add(int(pin[1:]))
+    for n in range(1, 256):
+        if n not in used:
+            return f"V{n}"
+    return None
+
+
+def _render_entry(entry: dict) -> str:
+    """One COINS element as source text, aligned like the hand-written ones."""
+    lines = [f"{_BRACE_INDENT}{{",
+             f"{_INDENT}# added via the dashboard {time.strftime('%Y-%m-%d')}"]
+    for key in _KEY_ORDER:
+        if key not in entry or entry[key] is None:
+            continue
+        label = '"%s":' % key
+        lines.append(f"{_INDENT}{label:<{_KEY_WIDTH}}{render(entry[key])},")
+    lines.append(f"{_BRACE_INDENT}}},")
+    return "\n".join(lines) + "\n"
+
+
+def add_coin(symbol: str, fields: Optional[dict] = None,
+             path: str | Path = DEFAULT_CONFIG_PATH) -> tuple[dict, Optional[Path]]:
+    """Append a new coin to COINS in config.py. Returns (entry, backup_path).
+
+    Only writes the file -- a new coin cannot be hot-applied, because the
+    running task set is fixed at startup (see config_reload). The caller is
+    expected to tell the user a restart is needed.
+    """
+    path = Path(path)
+    symbol = normalize_symbol(symbol)
+
+    existing = parse_config_coins(path)
+    if any(e.get("symbol") == symbol for e in existing):
+        raise ConfigEditError(f"{symbol} is already in COINS")
+
+    entry: dict = {"symbol": symbol}
+    for key, default in NEW_COIN_DEFAULTS.items():
+        raw = (fields or {}).get(key, default)
+        entry[key] = coerce(key, raw)
+    pin = (fields or {}).get("blynk_pin") or next_blynk_pin(existing)
+    if pin:
+        entry["blynk_pin"] = coerce("blynk_pin", pin)
+
+    data = path.read_bytes()
+    tree = ast.parse(data, filename=str(path))
+    starts = _line_starts(data)
+    coins_node = _find_coins_list(tree)
+
+    # Insert just before the list's closing bracket, keeping every existing
+    # line -- including the commented-out coin blocks -- exactly as it was.
+    _, list_end = _span(starts, coins_node)
+    close = data.rfind(b"]", 0, list_end)
+    if close < 0:
+        raise ConfigEditError("could not find the end of the COINS list")
+    line_start = data.rfind(b"\n", 0, close) + 1
+    new_data = data[:line_start] + _render_entry(entry).encode() + data[line_start:]
+
+    _commit(path, new_data, lambda coins: _check_present(coins, symbol, entry))
+    return entry, _last_backup
+
+
+def remove_coin(symbol: str, path: str | Path = DEFAULT_CONFIG_PATH
+                ) -> tuple[dict, Optional[Path]]:
+    """Delete a coin's entry from COINS. Returns (removed_entry, backup_path).
+
+    The coin's state file and its row in the retired ledger are left alone:
+    deleting a config entry is an editing operation, not a decision to throw
+    away trading history. Booking PnL before removal is the RETIRE action's
+    job, and the caller should insist on it.
+    """
+    path = Path(path)
+    symbol = normalize_symbol(symbol)
+
+    removed = None
+    for entry in parse_config_coins(path):
+        if entry.get("symbol") == symbol:
+            removed = entry
+            break
+    if removed is None:
+        raise ConfigEditError(f"{symbol} is not in COINS")
+
+    data = path.read_bytes()
+    tree = ast.parse(data, filename=str(path))
+    starts = _line_starts(data)
+    coin_node = _find_coin_dict(tree, symbol)
+
+    # Widen the dict's span to whole lines, so the entry's own indentation, its
+    # trailing comma and its newline go with it. Per-coin comments live INSIDE
+    # the braces in this file, so they are carried along automatically.
+    start, end = _span(starts, coin_node)
+    start = data.rfind(b"\n", 0, start) + 1
+    while end < len(data) and data[end:end + 1] in (b",", b" ", b"\t", b"\r"):
+        end += 1
+    if data[end:end + 1] == b"\n":
+        end += 1
+    new_data = data[:start] + data[end:]
+
+    _commit(path, new_data, lambda coins: _check_absent(coins, symbol))
+    return removed, _last_backup
+
+
+# --- shared write-back ------------------------------------------------------
+
+_last_backup: Optional[Path] = None
+
+
+def _check_present(coins: list, symbol: str, expected: dict) -> None:
+    match = next((c for c in coins if c.get("symbol") == symbol), None)
+    if match is None:
+        raise ConfigEditError(f"write-back check failed: {symbol} is not in the edited file")
+    for key, value in expected.items():
+        if match.get(key) != value:
+            raise ConfigEditError(
+                f"write-back check failed for {key}: file would hold "
+                f"{match.get(key)!r}, expected {value!r} -- config.py not modified")
+
+
+def _check_absent(coins: list, symbol: str) -> None:
+    if any(c.get("symbol") == symbol for c in coins):
+        raise ConfigEditError(f"write-back check failed: {symbol} is still in the edited file")
+
+
+def _commit(path: Path, new_data: bytes, verify) -> None:
+    """Validate candidate source, back up the old file, swap the new one in.
+
+    Same contract as set_fields(): config.py is either fully updated or left
+    exactly as it was.
+    """
+    global _last_backup
     tmp = path.with_suffix(".py.tmp-edit")
     try:
         tmp.write_bytes(new_data)
-        reparsed = _entry_for(symbol, parse_config_coins(tmp))
-        for edit in edits:
-            got = reparsed.get(edit.key, None)
-            if got != edit.new:
-                raise ConfigEditError(
-                    f"write-back check failed for {edit.key}: file would hold "
-                    f"{got!r}, expected {edit.new!r} -- config.py not modified")
-        backup = _backup(path)
+        verify(parse_config_coins(tmp))
+        _last_backup = _backup(path)
         os.replace(tmp, path)
     except ConfigEditError:
         tmp.unlink(missing_ok=True)
@@ -368,5 +561,3 @@ def set_fields(symbol: str, updates: dict, path: str | Path = DEFAULT_CONFIG_PAT
     except Exception as exc:
         tmp.unlink(missing_ok=True)
         raise ConfigEditError(f"edited config.py did not load ({exc}) -- not saved") from exc
-
-    return edits, backup

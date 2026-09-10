@@ -278,6 +278,8 @@ def _status_tags(st: State, cfg: dict) -> list:
     tags = []
     if st.paused:
         tags.append("[PAUSED]")
+    if st.buys_paused:
+        tags.append("[BUYS-PAUSED]")
     if st.pending_buy_order is not None:
         tags.append(f"[BUY LIMIT @${st.pending_buy_order.limit_price:,.{pp}f}]")
     elif st.trailing_buy.armed:
@@ -333,6 +335,8 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
         mode_line += "  [BE-EXIT]"
     if state.pause_after_sell:
         mode_line += "  [PAUSE-AFTER-SELL]"
+    if state.buys_paused:
+        mode_line += "  [BUYS-PAUSED]"
     if state.stop_loss_pct:
         mode_line += f"  [SL -{state.stop_loss_pct:.2%}]"
     out.append(f"{'Mode:':<{L}}{mode_line}")
@@ -381,7 +385,9 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
 
     out.append("")
     out.append("Next BUY:")
-    if state.pending_buy_order is not None:
+    if state.buys_paused:
+        out.append(f"{'  Status:':<{L}}buying PAUSED -- no new buys; sells carry on (menu b resumes)")
+    elif state.pending_buy_order is not None:
         pbo = state.pending_buy_order
         offset_pct = cfg.get("limit_buy_offset_pct", 0.001)
         cancel_buffer = max(trail_buy_pct, offset_pct)
@@ -742,7 +748,8 @@ async def run(simulate_file: Optional[str], dry_run: bool,
         "  1 stats      2 config             3 set/clear stop-loss   4 pause\n"
         "  5 breakeven  6 pause-after-sell   7 BUY now               8 arm buy-trail\n"
         "  9 sell ALL now (market)           p sell ALL at MY price (target)\n"
-        "  a arm sell-trail   t clear targets   r RETIRE coin   c clear stats (full reset)\n"
+        "  a toggle sell-trail (arm/disarm)   b toggle pause buying (sells carry on)\n"
+        "  t clear targets   r RETIRE coin   c clear stats (full reset)\n"
         "  8 buy-trail: trailing dip-buy -- arms at current price, trails the low, fires ONE\n"
         "    buy on a +trail_buy_pct rebound (works flat or holding; disarm via t)\n"
         "  3 stop-loss: % below avg entry (tracks avg as the grid grows); on hit market-sells\n"
@@ -1057,6 +1064,89 @@ async def run(simulate_file: Optional[str], dry_run: bool,
             _disable_keypress(fd, old_term)
             fd, old_term = None, None
 
+    bypass_cooldown = bool(simulate_file)
+    heartbeat_task = asyncio.create_task(blynk_heartbeat(blynk, states, enabled))
+    balance_task = None
+    if MODE == "live" and not simulate_file:
+        bases = tuple(c["symbol"].split("/")[0] for c in enabled)
+        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder, bases))
+    # Coin tasks live in a set rather than a fixed list, and the run loop waits
+    # on an Event instead of one gather() over that list -- so a coin added at
+    # runtime (dashboard "+ Add coin") can join the same supervision, be logged
+    # the same way if it dies, and be cancelled the same way on shutdown.
+    coin_tasks: set = set()
+    stop = asyncio.Event()
+
+    def _coin_task_done(task: asyncio.Task) -> None:
+        coin_tasks.discard(task)
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logging.error("Coin task %s ended with: %s", task.get_name(), exc)
+        if not coin_tasks:
+            stop.set()          # every coin has finished -- nothing left to run
+
+    def _start_coin_task(cfg: dict) -> asyncio.Task:
+        task = asyncio.create_task(
+            run_coin(
+                exchange, cfg, states[cfg["symbol"]], wallet,
+                cmd_queues[cfg["symbol"]], last_price, states, blynk,
+                push_notify, dry_run, simulate_file, bypass_cooldown,
+            ),
+            name=cfg["symbol"],
+        )
+        task.add_done_callback(_coin_task_done)
+        coin_tasks.add(task)
+        return task
+
+    for c in enabled:
+        _start_coin_task(c)
+
+    async def spawn_coin(cfg: dict) -> str:
+        """Start trading a coin that wasn't running at startup.
+
+        Everything the startup path does for one coin, in the same order: load
+        its state file, give it a queue and a price slot, reconcile the tracked
+        position to the exchange (live only -- a fresh coin is flat, so this is
+        a no-op unless an old state file came back with it), register it with
+        the menu/dashboard, then start its task. Returns a note for the caller
+        to show the user. Raises ValueError if it's already running.
+        """
+        symbol = cfg["symbol"]
+        if symbol in states:
+            raise ValueError(f"{symbol} is already running")
+
+        state = load_state(symbol, mode=MODE)
+        state.mode = MODE
+        state.paper_wallet_usd = 0.0
+        states[symbol] = state
+        cmd_queues[symbol] = asyncio.Queue()
+        last_price[symbol] = None
+
+        if MODE == "live" and not simulate_file:
+            try:
+                await reconcile_all_to_exchange(exchange, {symbol: state}, [cfg])
+            except Exception as e:
+                logging.warning("%s: reconcile on hot-add failed: %s", symbol, e)
+
+        # One dict per symbol, shared by both lists: `enabled` drives menu
+        # numbering and the dashboard's active table, COINS drives the Blynk
+        # per-coin pin push and the dashboard's inactive list.
+        for registry in (enabled, COINS):
+            match = next((c for c in registry if c["symbol"] == symbol), None)
+            if match is None:
+                registry.append(cfg)
+            elif match is not cfg:
+                registry[registry.index(match)] = cfg
+
+        _start_coin_task(cfg)
+        resumed = (f" -- resumed {len(state.positions)} position(s) from its state file"
+                   if state.positions else "")
+        logging.warning("HOT-ADD %s: now trading as coin %d%s%s", symbol, len(enabled),
+                        resumed, "  [PAUSED]" if state.paused else "")
+        return (f"{symbol} started as coin {len(enabled)} without a restart"
+                + (resumed or "") + (" (it is PAUSED)" if state.paused else ""))
+
     # Web dashboard: reads these very objects and enqueues onto these very
     # queues, so it and the keypress menu are always the same bot.
     dash_runner = None
@@ -1065,37 +1155,23 @@ async def run(simulate_file: Optional[str], dry_run: bool,
             dashboard.DashboardContext(
                 states=states, cfgs=enabled, wallet=wallet, last_price=last_price,
                 cmd_queues=cmd_queues, balance_holder=balance_holder,
+                exchange=exchange, spawn_coin=spawn_coin,
                 mode=MODE, dry_run=dry_run,
             ),
             dashboard_host, dashboard_port,
         )
 
-    bypass_cooldown = bool(simulate_file)
-    heartbeat_task = asyncio.create_task(blynk_heartbeat(blynk, states, enabled))
-    balance_task = None
-    if MODE == "live" and not simulate_file:
-        bases = tuple(c["symbol"].split("/")[0] for c in enabled)
-        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder, bases))
-    coin_tasks = [
-        asyncio.create_task(
-            run_coin(
-                exchange, c, states[c["symbol"]], wallet,
-                cmd_queues[c["symbol"]], last_price, states, blynk,
-                push_notify, dry_run, simulate_file, bypass_cooldown,
-            ),
-            name=c["symbol"],
-        )
-        for c in enabled
-    ]
 
     try:
-        results = await asyncio.gather(*coin_tasks, return_exceptions=True)
-        for c, r in zip(enabled, results):
-            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
-                logging.error("Coin task %s ended with: %s", c["symbol"], r)
+        await stop.wait()
     except (asyncio.CancelledError, KeyboardInterrupt):
         logging.info("Shutdown requested")
     finally:
+        for task in list(coin_tasks):
+            task.cancel()
+        if coin_tasks:
+            # Let each run_coin's finally: save_state run before we save again.
+            await asyncio.gather(*coin_tasks, return_exceptions=True)
         heartbeat_task.cancel()
         if balance_task is not None:
             balance_task.cancel()

@@ -476,3 +476,147 @@ Sep 9 - dashboard: coin logos in the coin list, detail header and the
   data/icons/ is inside the gitignored data/ dir, so a fresh clone starts with
   no icons and one button press populates them.
   NOTE: needs a restart (new Python module + snapshot field).
+
+Sep 9 - dashboard can now ADD and REMOVE coins, not just re-tune them
+  (helpers/config_edit.py, helpers/dashboard.py, helpers/web/).
+  Add: "+ Add coin" in the header opens a form pre-filled from the server's own
+  defaults. The pair is validated three ways -- shape (BASE/QUOTE), not already
+  in COINS, and, when the exchange's markets are loaded, that the exchange
+  actually lists it (a typo used to surface only as a stream error after a
+  restart). The entry is appended to COINS rendered in the file's own style, and
+  gets the lowest unused Blynk V-pin so it can't collide with an existing coin.
+  It is written DISABLED on purpose: adding needs a restart anyway, so the safe
+  order is add it, look at the numbers, then enable it. Nothing starts spending
+  money on its own.
+  Remove: "Remove coin" in a coin's config panel deletes its COINS entry. It
+  REFUSES by default on anything that would lose track of real money -- an open
+  position (the coins stay on the exchange, unmanaged), a resting order that
+  would be orphaned, or realized PnL never booked to the retired ledger (it
+  would just vanish from the totals). The refusal lists exactly which of those
+  apply and points at RETIRE, which handles all three properly. Forcing past it
+  needs the ticker typed out. The state file and any retired-ledger row are left
+  on disk either way: removing a config entry is an edit, not a decision to
+  destroy history. A removed coin keeps running until the next restart, and the
+  UI says so (the existing 'c' reload preview already warns about it too).
+  Both are file-only -- the running task set is fixed at startup, so neither can
+  be hot-applied. Same write-back guarantees as the existing field editor: the
+  candidate file is parsed and re-checked before it can replace config.py, the
+  previous version is backed up to data/config_backups/, and the swap is atomic.
+  Verified an add+remove round-trip leaves config.py byte-identical, and that
+  removing a hand-written entry keeps its neighbours, their comments and the
+  commented-out coin blocks intact.
+  FIX (found while building this): modal() cleared the whole modal root when a
+  confirm handler resolved, so a dialog opened from inside onConfirm was wiped
+  immediately -- which is exactly what the two-stage remove flow needs to do.
+  Each dialog now dismisses only its own node.
+  conductor.py passes the ccxt exchange into DashboardContext so the new-pair
+  check can see the loaded markets.
+  NOTE: needs a restart.
+
+Sep 9 - adding or enabling a coin no longer needs a restart.
+  conductor.run() used to await one asyncio.gather() over a fixed list of coin
+  tasks, so a task created later was outside the supervision: its exceptions
+  went unlogged and shutdown didn't cancel it. Coin tasks now live in a set with
+  a done-callback that logs failures and notices when the last one ends, and the
+  run loop waits on an Event instead. Shutdown behaviour is unchanged --
+  verified by cancelling the main task on both the old and new code: both log
+  "Shutdown requested", cancel every coin task, save state and exit with no
+  traceback and no hang.
+  On top of that, spawn_coin() does for one coin exactly what startup does for
+  all of them, in the same order: load its state file, give it a command queue
+  and a price slot, reconcile the tracked position to the exchange (live only;
+  a no-op for a flat coin, but it matters if an old state file came back with
+  it), register it in `enabled` + COINS as ONE shared dict, then start its task.
+  So the dashboard's "+ Add coin" with Enabled=True starts trading immediately,
+  and flipping Enabled on a disabled coin starts it too. Turning a coin OFF
+  still needs a restart -- stopping a task mid-cycle with an open position and
+  possibly a resting order is a different problem, and not one to solve by
+  cancelling a task.
+  New coins still default to DISABLED in the add form: adding and starting are
+  now separate decisions, which is the point.
+  FIX found while testing: a coin added while disabled was written to config.py
+  but never appeared in the dashboard, because the snapshot's inactive list is
+  built from the in-memory COINS -- so it was invisible, including to the toggle
+  that would have enabled it. add_coin_api now registers the entry in COINS
+  immediately (replacing any same-symbol entry so one dict is shared), and
+  removing a coin that isn't running unregisters it. A REMOVED coin that is
+  still running keeps its slot and stays listed as active, because it genuinely
+  is still trading until the restart.
+  Verified end to end: add disabled -> shows as inactive; enable -> starts as
+  coin 14 with live prices and manual commands reaching it; force-remove while
+  running -> still listed and trading; add+remove a never-run coin -> appears
+  and disappears cleanly. No tracebacks throughout.
+  NOTE: still needs one restart to pick THIS change up. After that, adding
+  coins won't.
+
+Sep 9 - code-review fixes (7 findings).
+  1. PAPER WALLET COULD GO NEGATIVE (helpers/wallet.py). spend() debited
+     unconditionally and nothing checked the balance first, so paper mode kept
+     buying with money it did not have -- PaperWallet(100) after three $100 buys
+     held -$200. With 13 coins x max_grid_levels x usd_per_buy (~$18,200) against
+     a $650 pool the strategy was never capital-constrained the way it is live,
+     which made the paper wallet, the dashboard's portfolio card and every paper
+     PnL comparison fiction. Replaced with try_spend(), which checks and debits
+     under the SAME lock (two coins buying on one tick cannot both pass the
+     check). paper_buy() now returns None when the pool is short and execute_buy
+     logs and skips instead of booking a position; the paper limit-buy fill drops
+     the resting order. Verified live: 5 forced buys against a $50 pool were all
+     refused, wallet stayed $50.00, zero positions booked.
+  2. PAPER LIMIT-BUY NEVER PAID ITS FEE (helpers/coin_runner.py). The fill
+     debited `gross` while _finalize_buy recorded qty*price + fee as the cost
+     basis, so a $100 fill left $0.20 unpaid -- PnL pessimistic by the fee,
+     wallet optimistic by the same amount, and the two never reconciled. Every
+     coin uses buy_order_type "limit" and the log holds 264 such fills. Now
+     debits gross + fee, matching the market path, which was already consistent.
+  3. SILENT PHANTOM SELL (helpers/coin_runner.py). check_pending_sell treated a
+     live order reported closed with filled<=0 as a full fill with no warning:
+     the position is wiped, cycle_count increments and realized PnL is credited
+     for a sale that never happened, while the coins sit on Kraken. The buy side
+     already logged a warning for exactly this. Added the matching warning so the
+     more damaging direction is visible. (Behaviour unchanged -- a real cancel
+     reports canceled/expired, not closed -- this is about being able to see it.)
+  4. Unclosed file handle in content_type() (helpers/icons.py), called on every
+     icon request; now uses a context manager.
+  5. set_fields() duplicated the temp-file / parse-check / backup / os.replace
+     sequence that _commit() already implements for add_coin and remove_coin.
+     Folded onto _commit with its own verify callback: one definition of how
+     config.py is safely replaced, ~15 lines gone. Rejection paths and the
+     comment/format-preserving round trip re-verified.
+  6. Removed ACTION_BY_KIND (helpers/actions.py) -- built at import, never read.
+  7. Removed the blynklib pin (helpers/requirements.txt) -- nothing imports it;
+     blynk.py deliberately uses stdlib urllib, as its own docstring says.
+  NOTE: needs a restart. No state-file format change.
+
+Sep 10 - three controls + a tidier Controls panel.
+  SELL-TRAIL IS NOW A TOGGLE (menu a / dashboard). A manually-armed sell-trail
+  could not be cancelled at all: every reset path was a fire, a fill or a full
+  reset, and pressing the key again just re-armed it at the current price.
+  Pressing it while a MANUAL trail is armed now disarms it, and the automatic
+  take-profit trail resumes. Pressing it with an auto trail armed still
+  converts that to a manual one, as before.
+  PAUSE BUYING (new menu key b / dashboard "Pause buying"). New persisted
+  State.buys_paused flag. Stops the coin ACCUMULATING while every exit stays
+  live -- sell-trail, target sell and stop-loss carry on, so a held position
+  can still close. Gates the initial-entry trail, the grid buy-trail and the
+  manual buy-trail in the tick loop. Turning it on cancels a resting limit buy
+  (via cancel_pending_buy_and_book, so a raced partial fill is still booked)
+  and clears a half-formed buy trail so it can't fire on resume; turning it off
+  on a flat coin resets the stale first-buy reference. Arming a buy-trail while
+  buying is paused is refused (it would sit idle, then fire the moment buying
+  resumed) and the dashboard disables that button. "Force BUY now" still works
+  as a deliberate one-off; its confirm dialog says so. Shown as [BUYS-PAUSED]
+  in the terminal and a BUYS PAUSED badge in the dashboard.
+  Verified deterministically with --simulate on a flat VVV fed a 1.5% dip and a
+  rebound: buys active -> entry trail armed and a LIMIT-BUY placed; buys paused
+  -> trail never armed, zero buys. Terminal menu driven under a pty.
+  GRID FULL is now red -- the status badge and the "Grid full" text in the
+  next buy/sell column (it was green there, which read as "go").
+  CONTROLS REORGANISED into four groups -- Run state (pause trading, pause
+  buying, pause after sell, breakeven exit), Buy, Sell (with the target-sell
+  and stop-loss inputs), Reset -- on an even grid. Toggles carry a status dot
+  and light up when on (amber for the two pauses, blue otherwise), and all of
+  them relabel live each poll rather than only Pause. Any catalog action not
+  placed in a group still gets a button under "Other", so a new action can't
+  silently go missing.
+  NOTE: needs a restart. State files gain a buys_paused field -- older builds
+  would reject the new key, so a rollback means removing it from state files.

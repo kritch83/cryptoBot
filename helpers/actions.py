@@ -37,20 +37,20 @@ ACTIONS: tuple[Action, ...] = (
     Action("4", "toggle pause",               "pause_toggle",         True),
     Action("5", "toggle breakeven-exit",      "arm_breakeven_exit",   True),
     Action("6", "toggle pause-after-sell",    "arm_pause_after_sell", True),
+    Action("b", "toggle pause buying (selling carries on)", "pause_buys_toggle", True),
     Action("7", "force BUY now (market)",     "buy",                  True, danger=True),
     Action("8", "arm buy-trail (trailing dip-buy; fires ONE buy on the rebound)",
            "arm_buy_trail", True),
     Action("9", "sell ALL now (market)",      "sell_all",             True, danger=True),
     Action("p", "sell ALL at MY price (post-only limit; pauses after fill)",
            "set_target_sell", True, danger=True, takes_value=True),
-    Action("a", "arm sell-trail",             "arm_sell_trail",       True),
+    Action("a", "toggle sell-trail (arm / disarm)", "arm_sell_trail", True),
     Action("t", "clear targets (reset first-buy to -drop_pct)", "clear_targets", True),
     Action("r", "RETIRE coin (book PnL to ledger + FULL reset)", "retire", True, danger=True),
     Action("c", "clear stats (FULL reset)",   "clear_stats",          True, danger=True),
 )
 
 ACTION_BY_KEY = {a.key: a for a in ACTIONS}
-ACTION_BY_KIND = {a.kind: a for a in ACTIONS}
 
 # Kinds that are printed locally by the CLI rather than queued for the coin task.
 LOCAL_KINDS = frozenset({"stats", "config"})
@@ -64,7 +64,8 @@ VALUE_LABELS = {"set_stop_loss":   ("stop-loss %",   "stop-loss"),
 
 REASONS = {
     "pause_toggle":         "manual pause toggle",
-    "arm_sell_trail":       "manual arm-sell-trail",
+    "arm_sell_trail":       "manual sell-trail toggle",
+    "pause_buys_toggle":    "manual pause-buying toggle",
     "arm_buy_trail":        "manual arm-buy-trail",
     "arm_breakeven_exit":   "manual breakeven-exit toggle",
     "arm_pause_after_sell": "manual pause-after-sell toggle",
