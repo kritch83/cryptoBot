@@ -1,23 +1,47 @@
-# gridBot
-<<<<<<< Updated upstream
-a bot that trades crypto based on grids
-=======
+# <img src="images/robot.png" height="70" align="absmiddle">CryptoBot
 
-A multi-coin grid / DCA trading bot for Kraken, built on CCXT Pro WebSockets.
-Each coin runs as its own asyncio task with its own price stream, state file and
-trailing entry/exit state machines. Drive it from the terminal menu or from the
-built-in web dashboard — both issue the same commands through the same queues,
-so the two can never disagree about what the bot is doing.
+A bot that trades crypto based on grids. DCA essentially. It also uses Blynk (https://blynk.cloud) for posting total PnL to the app and Pushover (pushover.net) for notifications (push) such as buys, take profits, stop losses, etc.. It uses CCXT Pro WebSockets for pulling/pushing the info.  Each coin runs as its own asyncio task with its own price stream, state file and
+trailing entry/exit state machines.  
 
-> ### ⚠️ This places real orders with real money when run with `--live`
-> It ships in paper mode and stays there unless you pass `--live`. Understand the
-> strategy below, read `helpers/config.py`, and paper-trade it first. Provided
-> as-is with no warranty — you are responsible for what it trades and what it
-> loses.
+#### Features
 
----
+- Trading strategy: grid/DCA on Kraken across many coins at once, each with its own settings. It buys a dip on the rebound, adds more buys as price falls further, and sells the whole position on a pullback once it's in profit.
 
-## How it trades
+- Order types: buys and sells can each be market or maker-only limit orders, chosen per coin. Limit orders cancel themselves if price moves away.
+
+- Modes: paper (the default), live, live dry-run, and replaying prices from a CSV. Paper mode has a real cash limit.
+
+- Exits: a stop-loss that sells everything and pauses the coin, a breakeven exit that covers fees, a limit sell at your own price, and a manual sell-trail that never sells at a loss.
+
+- Manual controls: pause trading, pause buying only, pause after the next sell, a one-off buy-trail, force buy or sell now, and clear targets or stats.
+
+- Retire a coin: records its lifetime profit in a ledger so it still counts in your totals, then resets it.
+
+- Safeguards: API calls go out one at a time so they can't collide, failed cancels are never lost track of, and partial fills are always recorded. Sells are limited to what's actually on Kraken, and holdings are matched to your Kraken balance at every startup.
+
+- Terminal menu: pick a coin by number and act on it, with an all-coins summary table and a live settings reload.
+
+- Web dashboard: account and profit totals, a profit-history chart, and a coin table with logos, status and next buy/sell prices. Each coin has a detail panel with grouped controls, and there's a settings editor that saves to config.py.
+
+- Notifications: Pushover alerts on every sell, and Blynk gets total and per-coin profit.
+
+
+
+
+
+#### ⚠️ This places orders with real money when run with `--live`
+
+
+The default config has examples of several coins. They are only examples. Use this program with caution. If you don't know what you are doing you can lose money easily. I provide the software as is. What you do with it is all you.
+
+I can't stress this enough:
+
+#### <u>ALWAYS DO YOU DUE DILIGENCE... ALWAYS!</u>
+
+
+<br></br>
+
+### <u>How it trades</u>
 
 One cycle, per coin:
 
@@ -37,20 +61,58 @@ Beyond the base loop: hard stop-loss, breakeven exit, pause-after-sell, manual
 target sell, manual buy/sell trails, and a ledger that keeps a retired coin's
 lifetime PnL in the totals after its state is wiped.
 
-## Quick start
+<br></b>
 
+## <img src="images/moneyFace.png" height="50" align="absmiddle"> Quick start <img src="images/moneyFace.png" height="50" align="absmiddle">
+
+
+1. Clone repo to your computer
 ```bash
-python3 -m venv venv && source venv/bin/activate
-pip install -r helpers/requirements.txt
-cp env.example .env       # then fill it in
+git clone https://github.com/kritch83/cryptoBot.git && cd cryptoBot
+```
+<br></br>
+
+2. Install python3
+```bash
+sudo apt install -y python3-dev python3-pip
 ```
 
-Edit the `COINS` list in `helpers/config.py`, then run **from the project root**
-(all paths are relative to it):
+<br></br>
 
+2. Create virtual environment
+```bash
+python3 -m venv env && source venv/bin/activate
+```
+
+<br></br>
+
+3. Install python & python libs
+```bash
+pip3 install -r helpers/requirements.txt
+```
+<br></br>
+
+4. Copy example env to .env & fill in with your keys/info
+```bash
+cp env.example .env && nano .env
+```
+<br></br>
+
+5. Edit the `COINS` list in `config.py` with your coins
+```bash
+nano helpers/config.py
+```
+<br></br>
+6. Then run **from the project root** (all paths are relative to it) one of two commands:
+<h5>paper mode:</h5>
 ```bash
 python conductor.py
 ```
+<h5>live mode:</h5>
+```bash
+python conductor.py --live
+```
+
 
 | Flag | Effect |
 | --- | --- |
@@ -61,7 +123,41 @@ python conductor.py
 | `--no-dashboard` | Don't start the web dashboard. |
 | `--dashboard-host` / `--dashboard-port` | Override the bind address / port. |
 
-## Controls
+<br></b>
+
+## <img src="images/graph1.png" height="70" align="absmiddle"><u> Dashboard </u>
+
+### <img src="images/down.png" height="70" align="absmiddle"> To pull up web dashboard the first time <img src="images/down.png" height="70" align="absmiddle"> 
+
+http://[hostIP]:8787/?token=DASHBOARD_TOKEN; the token is kept in a cookie after the first visit.
+
+
+![image of dashboard](images/dashboard.png "Bot Dashboard")
+
+- Account total (cash + coins at market — real assets, no unrealized PnL),
+  realized PnL, position value and unrealized as separate cards.
+- Per-coin table: price, levels, avg entry, position value, unrealized, realized,
+  cycles, next buy/sell with distance from current price, and status badges.
+  Click a header to sort, drag one to reorder; the layout is remembered per browser.
+- Click a row for its detail panel — position breakdown, open levels, the next
+  buy/sell math, and the full control set. The list stays put; the panel opens
+  below it.
+- A config editor that writes changes back into `helpers/config.py` **and**
+  hot-applies them to the running coin. Coins can be **added** (validated against
+  the exchange's markets; starts trading immediately if you enable it, no restart)
+  and **removed** (refused while the coin holds a position, has a resting order,
+  or has unbooked PnL — retire it first).
+- Realized-PnL equity curve, parsed out of the log.
+- Coin logos, fetched once to `data/icons/` and served locally afterwards.
+
+---
+
+
+
+### <img src="images/coin.png" height="50" align="absmiddle">Coin Controls
+
+![image of dashboard](images/dash2.png "Bot Dashboard")
+
 
 Both front-ends put a `PendingAction` on the coin's queue; it is applied on that
 coin's next price tick. Every action asks for confirmation first.
@@ -81,26 +177,9 @@ coin's next price tick. Every action asks for confirmation first.
 | `7` | force BUY now (market) | | |
 | `8` | arm buy-trail (trailing dip-buy) | | |
 
-**Web dashboard** — `http://<host>:8787/?token=<DASHBOARD_TOKEN>`; the token is
-kept in a cookie after the first visit.
+<br></b>
 
-- Account total (cash + coins at market — real assets, no unrealized PnL),
-  realized PnL, position value and unrealized as separate cards.
-- Per-coin table: price, levels, avg entry, position value, unrealized, realized,
-  cycles, next buy/sell with distance from current price, and status badges.
-  Click a header to sort, drag one to reorder; the layout is remembered per browser.
-- Click a row for its detail panel — position breakdown, open levels, the next
-  buy/sell math, and the full control set. The list stays put; the panel opens
-  below it.
-- A config editor that writes changes back into `helpers/config.py` **and**
-  hot-applies them to the running coin. Coins can be **added** (validated against
-  the exchange's markets; starts trading immediately if you enable it, no restart)
-  and **removed** (refused while the coin holds a position, has a resting order,
-  or has unbooked PnL — retire it first).
-- Realized-PnL equity curve, parsed out of the log.
-- Coin logos, fetched once to `data/icons/` and served locally afterwards.
-
-## Configuration
+### <img src="images/wrench.png" height="50" align="absmiddle">Configuration
 
 Tunables live per coin in `COINS` in [`helpers/config.py`](helpers/config.py):
 
@@ -126,7 +205,7 @@ running, and the module-level constants (fees, `ACTION_COOLDOWN_SEC`,
 
 Secrets go in `.env`, never in `config.py` — see [`env.example`](env.example).
 
-## Layout
+### <img src="images/graph.png" height="50" align="absmiddle">Layout
 
 ```
 conductor.py            entry point: CLI, terminal menu, task orchestration
@@ -146,7 +225,7 @@ helpers/
 data/                   state, logs, ledgers, icons, config backups (gitignored)
 ```
 
-## Data files
+### <img src="images/data.png" height="50" align="absmiddle">Data files
 
 | File | Contents |
 | --- | --- |
@@ -161,13 +240,18 @@ Coin logos are matched by ticker, which is a guess — tickers are not unique. T
 match is named in the fetch report; correct a wrong one by putting the right
 CoinGecko id in `data/icons/overrides.json`.
 
-## Notifications
+<br></b>
+
+## <img src="images/notify.png" height="49" align="absmiddle">Notifications
 
 Optional and independent: **Pushover** for fills, **Blynk** for realized PnL on
 virtual pins (`V0` = total, one pin per coin). Both are disabled by leaving their
 tokens blank in `.env`.
 
-## Security
+<br></b>
+
+## <img src="images/lock.png" height="50" align="absmiddle">Security 
+
 
 The dashboard can place and cancel real orders, so it refuses to start on a
 non-loopback address without `DASHBOARD_TOKEN` set. It is plain HTTP intended for
@@ -178,7 +262,7 @@ tunnel:
 python conductor.py --dashboard-host 127.0.0.1
 ssh -L 8787:localhost:8787 you@your-server
 ```
+<br></b>
 
-`.env` (API keys) and `data/` (positions, balances, trade history) are gitignored.
-Keep it that way.
->>>>>>> Stashed changes
+
+# <img src="images/rockOn.png" height="90" align="absmiddle">Enjoy!

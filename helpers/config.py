@@ -423,8 +423,8 @@ COINS = [
         "usd_per_buy":          120.0,
         "max_grid_levels":      12,
         "enabled":              True,
-        "blynk_pin":            "V7",
-    },
+        "blynk_pin":            "V21",
+    }
     {
         # added via the dashboard 2026-09-10
         "symbol":               "SUI/USD",
@@ -440,7 +440,7 @@ COINS = [
         "usd_per_buy":          100.0,
         "max_grid_levels":      12,
         "enabled":              True,
-        "blynk_pin":            "V21",
+        "blynk_pin":            "V22",
     },
 ]
 
@@ -483,7 +483,7 @@ DASHBOARD_PORT    = int(os.getenv("DASHBOARD_PORT", "8787"))
 DASHBOARD_TOKEN   = os.getenv("DASHBOARD_TOKEN", "")         # shared secret; required off-loopback
 
 # --- Blynk (push realized PnL to virtual pins) ------------------------------
-BLYNK_ENABLED       = True                     # master switch -- set False to disable all Blynk pushes
+BLYNK_ENABLED       = false                     # master switch -- set False to disable all Blynk pushes
 BLYNK_TOKEN         = os.getenv("BLYNK_TOKEN", "")  # Blynk Cloud token (set in .env)
 BLYNK_TOTAL_PNL_PIN = "V0"                     # pin for sum-of-all-coins realized PnL
 BLYNK_HEARTBEAT_SEC = 120                       # also push every N seconds even with no trades
