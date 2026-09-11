@@ -79,38 +79,39 @@ sudo apt install -y python3-dev python3-pip
 
 <br></br>
 
-2. Create virtual environment
+3. Create virtual environment
 ```bash
 python3 -m venv env && source venv/bin/activate
 ```
 
 <br></br>
 
-3. Install python & python libs
+4. Install python & python libs
 ```bash
 pip3 install -r helpers/requirements.txt
 ```
 <br></br>
 
-4. Copy example env to .env & fill in with your keys/info
+5. Copy example env to .env & fill in with your keys/info
 ```bash
 cp env.example .env && nano .env
 ```
 <br></br>
 
-5. Edit the `COINS` list in `config.py` with your coins
+6. Edit the `COINS` list in `config.py` with your coins
 ```bash
 nano helpers/config.py
 ```
 <br></br>
-6. Then run **from the project root** (all paths are relative to it) one of two commands:
+
+7. Then run **from the project root** (all paths are relative to it) one of two commands:
 <h5>paper mode:</h5>
-```bash
-python conductor.py
+```
+python3 conductor.py
 ```
 <h5>live mode:</h5>
-```bash
-python conductor.py --live
+```
+python3 conductor.py --live
 ```
 
 
