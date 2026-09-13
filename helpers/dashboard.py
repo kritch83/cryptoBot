@@ -27,13 +27,16 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import secrets
+import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from . import icons, trade_history
 from .actions import (
@@ -48,6 +51,7 @@ from .actions import (
 from .coin_runner import sell_threshold
 from .config import (
     COINS,
+    DASHBOARD_ALLOWED_HOSTS,
     DASHBOARD_HOST,
     EXCHANGE_ID,
     DASHBOARD_PORT,
@@ -747,6 +751,86 @@ def remove_coin_api(ctx: DashboardContext, symbol: str, force: bool = False) -> 
             "backup": str(backup) if backup else None, "notes": notes}
 
 
+# --- request guard -----------------------------------------------------------
+#
+# Two attacks, both proven against this dashboard before this guard existed:
+#
+#  * DNS rebinding. A malicious site points its own domain at 127.0.0.1 (or a
+#    LAN address); the browser then treats the dashboard as that site's own
+#    origin. With no token set -- which loopback mode allows -- that is full
+#    control. The tell is the Host header, which carries the attacker's domain.
+#
+#  * Cross-site request forgery from another PORT on the same host. Browsers
+#    count every port of a hostname as the same "site", so SameSite=Lax still
+#    sends the login cookie with a hidden form posted from, say, another app on
+#    kritchserver. aiohttp's request.json() doesn't check Content-Type, so the
+#    form's text/plain body parsed as a real command.
+
+UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def split_host(host_header: str) -> str:
+    """Hostname part of a Host header: 'kritchserver:8787' -> 'kritchserver'."""
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):                       # [::1]:8787
+        return h[1:h.find("]")] if "]" in h else h[1:]
+    name, sep, port = h.rpartition(":")
+    return name if sep and port.isdigit() else h
+
+
+def allowed_hostnames(extra=()) -> frozenset:
+    """Names this dashboard answers to: localhost, this machine's own names,
+    plus DASHBOARD_ALLOWED_HOSTS (a reverse-proxy domain, a custom DNS name)."""
+    names = {"localhost"}
+    for name in (socket.gethostname(), socket.getfqdn()):
+        name = (name or "").lower().rstrip(".")
+        if name:
+            short = name.split(".")[0]
+            names.update({name, short, f"{short}.local"})
+    names.update(h.lower().rstrip(".") for h in extra if h)
+    return frozenset(names)
+
+
+def host_is_allowed(host_header: str, allowed: frozenset) -> bool:
+    """True for an IP literal or an allowed name. An IP literal is always safe:
+    a rebinding attack only works through a domain name, so the Host header
+    it produces is that name, never an address."""
+    name = split_host(host_header).rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return name in allowed
+
+
+def guard_rejection(method: str, host_header: str, content_type: str,
+                    headers, allowed: frozenset) -> Optional[tuple]:
+    """Why a request must be refused, as (status, message) -- or None if it may
+    proceed. Pure, so every rule is testable without a server."""
+    if not host_is_allowed(host_header, allowed):
+        name = split_host(host_header)
+        return (403, f"Host '{name}' is not allowed. If that is how you reach this "
+                     f"dashboard, add DASHBOARD_ALLOWED_HOSTS={name} to .env and restart.")
+    # Browsers label every request with where it came from. Other sites -- and
+    # other ports on this host, which count as 'same-site' -- may open the page,
+    # but not call the API or submit anything.
+    site = headers.get("Sec-Fetch-Site")
+    if site in ("cross-site", "same-site") and not (
+            headers.get("Sec-Fetch-Mode") == "navigate" and method in ("GET", "HEAD")):
+        return (403, "request did not come from this dashboard")
+    if method in UNSAFE_METHODS:
+        # An HTML form can only send urlencoded, multipart or text/plain, and a
+        # cross-origin fetch sending JSON needs a CORS preflight we never grant.
+        if content_type != "application/json":
+            return (415, "commands must be sent as application/json")
+        origin = headers.get("Origin")
+        if origin is not None and urlsplit(origin).netloc.lower() != (host_header or "").lower():
+            return (403, "request did not come from this dashboard")
+    return None
+
+
 # --- HTTP -------------------------------------------------------------------
 
 def _make_app(ctx: DashboardContext):
@@ -772,6 +856,26 @@ def _make_app(ctx: DashboardContext):
         if not isinstance(body, dict):
             raise web.HTTPBadRequest(text="expected a JSON object")
         return body
+
+    allowed_hosts = allowed_hostnames(DASHBOARD_ALLOWED_HOSTS)
+    warned_hosts: set = set()
+
+    @web.middleware
+    async def guard_middleware(request, handler):
+        """Refuse anything that did not come from this dashboard's own page --
+        see guard_rejection(). Runs before auth, so a forged request is turned
+        away whether or not it happened to carry a valid cookie."""
+        rejection = guard_rejection(request.method, request.host, request.content_type,
+                                    request.headers, allowed_hosts)
+        if rejection is None:
+            return await handler(request)
+        status, message = rejection
+        if status == 403 and message.startswith("Host") and request.host not in warned_hosts:
+            warned_hosts.add(request.host)          # once per name, not per poll
+            logging.warning("DASHBOARD: %s", message)
+        if request.path.startswith("/api/"):
+            return web.json_response({"ok": False, "error": message}, status=status)
+        return web.Response(status=status, text=message)
 
     @web.middleware
     async def auth_middleware(request, handler):
@@ -934,7 +1038,7 @@ def _make_app(ctx: DashboardContext):
             "lines": trade_history.tail_log(limit, symbol, request.query.get("contains") or None),
         })
 
-    app = web.Application(middlewares=[errors_middleware, auth_middleware])
+    app = web.Application(middlewares=[errors_middleware, guard_middleware, auth_middleware])
     app.add_routes(routes)
     return app
 

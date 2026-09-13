@@ -620,3 +620,57 @@ Sep 10 - three controls + a tidier Controls panel.
   silently go missing.
   NOTE: needs a restart. State files gain a buys_paused field -- older builds
   would reject the new key, so a rollback means removing it from state files.
+
+Sep 13 - SECURITY: dashboard request guard + pinned icon downloads.
+  Found by a vulnerability scan and PROVEN against sandbox copies first.
+  1. CROSS-SITE REQUEST FORGERY from another port on the same host. Browsers
+     count every port of a hostname as one "site", so SameSite=Lax still sent
+     the login cookie with a hidden form posted from any other app on the box;
+     and aiohttp's request.json() ignores Content-Type, so the form's text/plain
+     body parsed as a real command. Proof: a page on :8792 made the dashboard on
+     :8793 queue a command. Now every state-changing request must be
+     application/json (a form can't send it; a cross-origin fetch sending it
+     needs a CORS preflight that is never granted), a browser-supplied Origin
+     must match this host, and requests browsers label cross-site/same-site
+     may navigate to the page but not call the API.
+  2. DNS REBINDING in no-token loopback mode (which the code allows, and the
+     SSH-tunnel setup uses). Nothing checked the Host header, so a malicious
+     site could point its domain at 127.0.0.1 and get full control. Proof: a
+     spoofed Host with no token read the snapshot and queued a command. Now the
+     dashboard only answers to localhost, this machine's own hostname and any
+     IP literal (a rebinding attack can only arrive under a domain name), plus
+     DASHBOARD_ALLOWED_HOSTS for a proxy domain. A refused name is logged once
+     with the exact value to add.
+  4. ICON DOWNLOADER trusted URLs from CoinGecko's JSON with no scheme/host
+     check; http:// to LAN addresses would have been requested if that data were
+     ever tampered with (file:// was only blocked by accident). Fetches are now
+     pinned to https:// on CoinGecko hosts, re-checked on every redirect hop.
+  Verified: 15 guard rules unit-tested; both attacks re-run and refused
+  (rebinding 403, nothing queued; forged posts 415/403); the dashboard's own
+  page, scripts with the token header, and real icon downloads still work.
+  New optional setting DASHBOARD_ALLOWED_HOSTS (config.py / .env.example).
+  NOTE: needs a restart. Reach the dashboard by IP, localhost or the server's own
+  hostname -- any other name needs adding to DASHBOARD_ALLOWED_HOSTS.
+
+Sep 13 - directory cleanup. Nothing deleted outright: everything below was
+  moved to ~/.Trash/gridBot-cleanup-2026-09-13/ with its original relative path,
+  so any of it can be dragged back. Every file was checked before moving -- no
+  reference from the code, web UI, README or .gitignore; state files only if
+  untouched for over an hour (coin not running) and holding no position, qty or
+  order.
+   - 9 orphaned macOS ._ metadata files (their real files were already gone),
+     including SMB delete-leftovers in images/.
+   - data/grid_bot.log.1 (0 bytes). The other rotated logs stay: the dashboard's
+     profit history reads them.
+   - images/100.png, images/party.png -- not referenced by the README.
+   - data/state_INJ_USD.json -- INJ not in COINS; fully empty.
+   - June 30 audit snapshots data/state_*.json.bak / .bak2 (7 files). Copies
+     remain inside backup_reconcile_20260901_000807/, which was kept.
+   - data/state_TRX_USD.json -- TRX not in COINS; held +$0.25 realized that was
+     never in the retired ledger.
+   - data/state_{BTC,M,NEAR,NIGHT,SLX}_USD.json -- zeroed, their PnL already in
+     data/retired_pnl.json. If one is re-enabled it now starts FRESH (unpaused),
+     not paused as the retire flow's leftover file used to make it.
+  Kept deliberately: venv/ (the server's runtime), rotated logs .2-.7,
+  data/config_backups/, data/icons/, state files for every active coin plus
+  BNB/NEO (unbooked PnL), and the Sep 1 reconcile backup.

@@ -424,7 +424,7 @@ COINS = [
         "max_grid_levels":      12,
         "enabled":              True,
         "blynk_pin":            "V21",
-    }
+    },
     {
         # added via the dashboard 2026-09-10
         "symbol":               "SUI/USD",
@@ -481,9 +481,13 @@ DASHBOARD_ENABLED = True
 DASHBOARD_HOST    = os.getenv("DASHBOARD_HOST", "0.0.0.0")   # 127.0.0.1 = loopback only
 DASHBOARD_PORT    = int(os.getenv("DASHBOARD_PORT", "8787"))
 DASHBOARD_TOKEN   = os.getenv("DASHBOARD_TOKEN", "")         # shared secret; required off-loopback
+# Extra hostnames the dashboard answers to (comma-separated), e.g. a reverse
+# proxy domain. localhost, this machine's own hostname and any IP address are
+# always accepted; anything else is refused (guards against DNS rebinding).
+DASHBOARD_ALLOWED_HOSTS = [h.strip() for h in os.getenv("DASHBOARD_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
 # --- Blynk (push realized PnL to virtual pins) ------------------------------
-BLYNK_ENABLED       = false                     # master switch -- set False to disable all Blynk pushes
+BLYNK_ENABLED       = False                     # master switch -- set False to disable all Blynk pushes
 BLYNK_TOKEN         = os.getenv("BLYNK_TOKEN", "")  # Blynk Cloud token (set in .env)
 BLYNK_TOTAL_PNL_PIN = "V0"                     # pin for sum-of-all-coins realized PnL
 BLYNK_HEARTBEAT_SEC = 120                       # also push every N seconds even with no trades

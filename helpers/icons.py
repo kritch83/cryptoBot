@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Iterable, Optional
+from urllib.parse import urlsplit
 
 ICON_DIR = Path("data/icons")
 MANIFEST = ICON_DIR / "_manifest.json"
@@ -45,6 +46,40 @@ HTTP_TIMEOUT = 15.0
 MAX_ICON_BYTES = 512 * 1024
 MAX_FETCH_PER_CALL = 60          # bound one refresh, so a typo can't spider the API
 USER_AGENT = "gridBot-dashboard/1.0 (local dashboard icon cache)"
+
+# Every URL this module opens ultimately comes out of a third-party JSON
+# response, so where it may point is pinned: HTTPS, CoinGecko hosts only, and
+# re-checked on every redirect hop (urllib follows redirects on its own). Without
+# this, tampered data could make the bot request addresses on the local network.
+ALLOWED_URL_HOSTS = frozenset({
+    "api.coingecko.com", "coin-images.coingecko.com", "assets.coingecko.com",
+})
+
+
+class UnsafeURL(ValueError):
+    """A URL outside the pinned scheme/hosts -- never opened."""
+
+
+def check_url(url: str) -> str:
+    """Return `url` unchanged if it is safe to open; raise UnsafeURL otherwise."""
+    parts = urlsplit(str(url))
+    host = (parts.hostname or "").lower()
+    if parts.scheme.lower() != "https" or host not in ALLOWED_URL_HOSTS:
+        raise UnsafeURL(f"refusing to fetch {url!r}: only https:// on "
+                        f"{', '.join(sorted(ALLOWED_URL_HOSTS))}")
+    if parts.username or parts.password:
+        raise UnsafeURL(f"refusing to fetch {url!r}: credentials in URL")
+    return str(url)
+
+
+class _PinnedRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only if its target passes check_url too."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_PinnedRedirects())
 
 # Accepted image types, by magic bytes. SVG is deliberately NOT accepted: it can
 # carry script, and these files are served back to the browser.
@@ -102,8 +137,8 @@ def content_type(path: Path) -> str:
 
 
 def _get(url: str) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+    request = urllib.request.Request(check_url(url), headers={"User-Agent": USER_AGENT})
+    with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP {response.status}")
         return response.read(MAX_ICON_BYTES + 1)
