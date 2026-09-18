@@ -674,3 +674,28 @@ Sep 13 - directory cleanup. Nothing deleted outright: everything below was
   Kept deliberately: venv/ (the server's runtime), rotated logs .2-.7,
   data/config_backups/, data/icons/, state files for every active coin plus
   BNB/NEO (unbooked PnL), and the Sep 1 reconcile backup.
+
+Sep 18 - account total now matches Kraken
+  - The dashboard's account total only counted USD + the coins the bot trades,
+    so assets like USDT (452 USDT, ~$452) were missing. The balance poller now
+    also values every other non-zero asset (stablecoins, coins no grid trades,
+    staked balances priced off their base) and adds it to the total, shown as
+    "+ other $X" with a per-asset breakdown in the card's tooltip.
+  - The balance poller now reads the enabled-coin list each pass, so coins
+    hot-added from the dashboard get their real wallet balance too.
+
+Sep 18 - dashboard performance charts
+  - Account value over time: helpers/equity.py records the account total (plus
+    cash / coins / other / realized / unrealized) every 10 minutes to
+    data/equity_history.jsonl while the dashboard runs; skips samples when the
+    total is incomplete (no balance yet, stale balance, coin without a price).
+    New GET /api/equity?days=N (thinned to ~600 points). Chart has 1D/1W/1M/3M/All
+    ranges, the period change, "bot banked" for the same period, and a hover
+    readout. The live total is appended as the last point.
+  - Realized profit by period: today / 7 days / 30 days / best day cards above
+    the realized PnL chart (from the logs; follow the chart's coin scope).
+  - "Where the money is" donut: cash, each coin (real wallet value), other
+    assets; slices under 2% fold into "N others". Click a coin to open it.
+  - Coin performance quadrant: x = realized, y = unrealized, dot size =
+    position value, red = underwater. Click a dot to open the coin.
+  - Row/donut/dot selection share one openCoin(); total cards share renderCards().

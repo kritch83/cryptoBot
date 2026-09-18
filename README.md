@@ -135,8 +135,17 @@ http://[hostIP]:8787/?token=DASHBOARD_TOKEN; the token is kept in a cookie after
 
 ![image of dashboard](images/dashboard.png "Bot Dashboard")
 
-- Account total (cash + coins at market — real assets, no unrealized PnL),
-  realized PnL, position value and unrealized as separate cards.
+- Account total (cash + coins + any other assets such as USDT, at market — real
+  assets, no unrealized PnL), realized PnL, position value and unrealized as
+  separate cards.
+- Account value over time (1D / 1W / 1M / 3M / All), recorded every 10 minutes
+  to `data/equity_history.jsonl`, with the period change and how much of it the
+  bot banked.
+- "Where the money is" donut (cash vs. each coin) and a coin-performance
+  quadrant: realized (banked) vs. unrealized (holding now) per coin, dot size =
+  position value. Click a slice or dot to open that coin.
+- Realized profit today / last 7 days / last 30 days / best day, above the
+  profit-history chart.
 - Per-coin table: price, levels, avg entry, position value, unrealized, realized,
   cycles, next buy/sell with distance from current price, and status badges.
   Click a header to sort, drag one to reorder; the layout is remembered per browser.
@@ -233,6 +242,7 @@ data/                   state, logs, ledgers, icons, config backups (gitignored)
 | `data/state_<PAIR>.json` | One per coin: positions, realized PnL, trails, pending orders |
 | `data/wallet.json` | Shared paper USD pool |
 | `data/retired_pnl.json` | Lifetime PnL of retired coins (hand-editable) |
+| `data/equity_history.jsonl` | Account value every 10 minutes — the dashboard's "Account value" chart |
 | `data/grid_bot.log` | Full activity log — also the source for the dashboard's PnL history |
 | `data/config_backups/` | Timestamped copies of `config.py` before each dashboard edit |
 | `data/icons/` | Coin logos, fetched once via the dashboard's "Fetch icons" button (or `python helpers/icons.py`) |
@@ -263,6 +273,12 @@ tunnel:
 python conductor.py --dashboard-host 127.0.0.1
 ssh -L 8787:localhost:8787 you@your-server
 ```
+
+The dashboard only answers to `localhost`, the server's own hostname and IP
+addresses, and only accepts commands sent by its own page. If you reach it by
+another name (a reverse-proxy domain, a custom DNS name), add it to `.env`:
+`DASHBOARD_ALLOWED_HOSTS=dash.example.com` — otherwise it refuses the request
+and logs the exact value to add.
 <br></b>
 
 

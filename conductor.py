@@ -102,14 +102,18 @@ async def push_notify(message: str) -> None:
 KRAKEN_BALANCE_REFRESH_SEC = 30.0
 
 
-async def kraken_balance_refresher(exchange, holder: dict, bases: tuple = ()) -> None:
+async def kraken_balance_refresher(exchange, holder: dict, enabled: list) -> None:
     """Periodically poll exchange.fetch_balance() and store balances into holder.
 
     holder is a shared dict {"usd": Optional[float], "coins": dict, "ts": float}
     read by the keypress-driven status screens. "coins" maps each base asset
     (e.g. "TAO") to its TOTAL balance on the exchange -- the *true* wallet
     holding (free + tied up in open orders), as opposed to state.total_qty_coin
-    which is only the bot's current open grid position. The loop never raises --
+    which is only the bot's current open grid position. "other" maps every
+    remaining non-zero asset (stablecoins, coins the bot doesn't trade, staked
+    balances) to {"qty", "value"} so the account total matches Kraken's; value
+    is None when there's no USD market to price it. `enabled` is read each pass
+    so coins hot-added from the dashboard are picked up. The loop never raises --
     errors are logged and the holder is left at its last-good value (or
     None/empty if never fetched).
     """
@@ -126,6 +130,7 @@ async def kraken_balance_refresher(exchange, holder: dict, bases: tuple = ()) ->
             # Per-coin TOTAL balances -- the real wallet holding for each base.
             coins: dict = {}
             total_map = bal.get("total") or {}
+            bases = {c["symbol"].split("/")[0] for c in enabled}
             for base in bases:
                 blk = bal.get(base) or {}
                 tot = blk.get("total")
@@ -134,12 +139,45 @@ async def kraken_balance_refresher(exchange, holder: dict, bases: tuple = ()) ->
                 if tot is not None:
                     coins[base] = float(tot)
             holder["coins"] = coins
+            holder["other"] = await _value_other_assets(exchange, total_map, bases)
             holder["ts"] = time.time()
         except ccxt.NetworkError as e:
             logging.warning("Kraken balance fetch network error: %s", e)
         except Exception as e:
             logging.warning("Kraken balance fetch failed: %s", e)
         await asyncio.sleep(KRAKEN_BALANCE_REFRESH_SEC)
+
+
+STABLE_USD = {"USDT", "USDC", "DAI", "PYUSD", "USDG", "RLUSD", "USDS", "TUSD", "USDP"}
+
+
+async def _value_other_assets(exchange, total_map: dict, bases: set) -> dict:
+    """{asset: {"qty", "value"}} for held assets outside USD and the bot's coins.
+
+    Staked/earn balances ("ADA.S", "DOT.F") are priced off their base asset.
+    A failed ticker fetch falls back to $1 for stablecoins and None otherwise,
+    so one bad market never blanks the whole account total.
+    """
+    held = {a: float(q) for a, q in total_map.items()
+            if q and a not in ("USD", "ZUSD") and a not in bases}
+    if not held:
+        return {}
+    underlying = {a: a.split(".")[0] for a in held}
+    symbols = sorted({f"{u}/USD" for u in underlying.values()
+                      if f"{u}/USD" in (exchange.markets or {})})
+    prices: dict = {}
+    if symbols:
+        try:
+            for sym, t in (await exchange.fetch_tickers(symbols)).items():
+                if t.get("last"):
+                    prices[sym.split("/")[0]] = float(t["last"])
+        except Exception as e:
+            logging.warning("Pricing non-grid assets failed: %s", e)
+    out = {}
+    for a, q in held.items():
+        px = prices.get(underlying[a]) or (1.0 if underlying[a] in STABLE_USD else None)
+        out[a] = {"qty": q, "value": None if px is None else q * px}
+    return out
 
 
 def _kraken_usd_line(balance_holder: Optional[dict], label_width: int) -> Optional[str]:
@@ -1068,8 +1106,7 @@ async def run(simulate_file: Optional[str], dry_run: bool,
     heartbeat_task = asyncio.create_task(blynk_heartbeat(blynk, states, enabled))
     balance_task = None
     if MODE == "live" and not simulate_file:
-        bases = tuple(c["symbol"].split("/")[0] for c in enabled)
-        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder, bases))
+        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder, enabled))
     # Coin tasks live in a set rather than a fixed list, and the run loop waits
     # on an Event instead of one gather() over that list -- so a coin added at
     # runtime (dashboard "+ Add coin") can join the same supervision, be logged

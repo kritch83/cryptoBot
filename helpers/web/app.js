@@ -15,6 +15,9 @@ const S = {
   openInactive: null,  // symbol of the expanded inactive row
   history: null,       // /api/history for the current chart scope
   chartScope: null,    // null = all coins
+  equity: null,        // /api/equity points for the selected range
+  valueDays: null,     // account-value range in days, 0 = all (see VALUE_RANGES)
+  drawn: {},           // chart -> data key last drawn, to skip identical redraws
   sort: { key: 'index', dir: 1 },
   dragKey: null,       // column key being dragged
   dragged: false,      // set during a drag so the drop doesn't also fire a sort
@@ -452,7 +455,9 @@ function accountCard(snap) {
     caveats.push(`${partial} coin(s) valued from grid qty`);
   }
   if (t.coins_no_price) caveats.push(`${t.coins_no_price} coin(s) with no price yet`);
-  if (t.inactive_holding) caveats.push(`excludes ${t.inactive_holding} disabled coin(s) holding`);
+  if (t.other_unpriced && t.other_unpriced.length) {
+    caveats.push(`no USD price for ${t.other_unpriced.join(', ')}`);
+  }
 
   if (snap.mode === 'live' && snap.wallet.kraken_age_sec !== null) {
     caveats.push(`balance ${ago(snap.wallet.kraken_age_sec)}`);
@@ -467,13 +472,17 @@ function accountCard(snap) {
     k: label,
     v: usd(t.total_value),
     sub: `cash ${usd(t.cash_usd)} + coins ${usd(t.holdings_value)}` +
+         (t.other_value ? ` + other ${usd(t.other_value)}` : '') +
          (caveats.length ? ` · ${caveats.join(' · ')}` : ''),
     title: 'Real assets only — cash plus the market value of what you hold. ' +
       'No unrealized PnL is included.\n\n' +
       (t.holdings_basis === 'wallet'
         ? 'Coins are valued from your real exchange balances' +
           (t.untracked_value ? ` (${usd(t.untracked_value)} of it held outside the grids).` : '.') +
-          ' Only coins configured in COINS are polled.'
+          ((t.other_assets || []).length
+            ? '\n\nOther assets (not traded by the bot):\n' + t.other_assets.map((o) =>
+                `  ${o.asset} ${o.qty} = ${o.value === null ? 'no USD price' : usd(o.value)}`).join('\n')
+            : '')
         : 'Coins are valued from the bot\'s tracked grid positions. Real exchange '
           + 'balances are only available in live mode.'),
   };
@@ -495,17 +504,23 @@ function renderTotals(snap) {
       sub: 'mark-to-market — not banked, not in the account total' },
   ];
 
-  // Cards persist and are patched, like every other repeating region -- see
-  // cached()/syncChildren(). Cheap, and it keeps text selection alive.
+  renderCards($('#totals'), 'tcard:', cards);
+}
+
+/* Cards persist and are patched, like every other repeating region -- see
+   cached()/syncChildren(). Cheap, and it keeps text selection alive. Each card
+   is {k: label, v: value, c: value class, sub, title, id: stable key}. */
+function renderCards(host, prefix, cards) {
   const keep = new Set();
   const nodes = cards.map((c) => {
-    const key = 'tcard:' + c.k;
+    const key = prefix + (c.id || c.k);
     keep.add(key);
     const card = cached(key, () => {
       const box = el('div', 'card panel');
       box.append(el('div', 'k', c.k), el('div', 'v'), el('div', 'sub'));
       return box;
     });
+    setText(card.children[0], c.k);
     const value = card.children[1];
     value.className = 'v ' + (c.c || '');
     setText(value, c.v);
@@ -513,8 +528,8 @@ function renderTotals(snap) {
     if (card.title !== (c.title || '')) card.title = c.title || '';
     return card;
   });
-  dropCached('tcard:', keep);
-  syncChildren($('#totals'), nodes);
+  dropCached(prefix, keep);
+  syncChildren(host, nodes);
 }
 
 /* --- status badges ------------------------------------------------------- */
@@ -772,11 +787,7 @@ function renderCoins(snap) {
     // The <tr> persists; only its cells are rebuilt (they hold no state).
     const tr = cached(rowKey, () => {
       const node = el('tr', 'coin');
-      node.onclick = () => {
-        S.open = S.open === symbol ? null : symbol;
-        if (S.open) { S.chartScope = symbol; loadHistory(); }
-        render();
-      };
+      node.onclick = () => openCoin(S.open === symbol ? null : symbol);
       return node;
     });
     tr.className = 'coin' + (coin.paused ? ' paused' : '') + (S.open === symbol ? ' open' : '');
@@ -788,6 +799,15 @@ function renderCoins(snap) {
   dropCached('row:', keep);
   syncChildren(body, desired);
   renderCoinDetail(selected);
+}
+
+/* Select a coin (or null to close): highlights its row, opens its detail
+   panel and scopes the realized chart to it. Shared by the table, the
+   allocation donut and the performance quadrant. */
+function openCoin(symbol) {
+  S.open = symbol;
+  if (symbol) { S.chartScope = symbol; loadHistory(); }
+  render();
 }
 
 /* The detail panel lives BELOW the whole table, not inside it: opening a coin
@@ -1316,6 +1336,387 @@ function renderInactive(snap) {
           `— ${desired.length} coin(s), retired PnL ${usdSigned(retired)}`);
 }
 
+/* --- small shared chart helpers ------------------------------------------ */
+
+function storeGet(key, fallback) {
+  try {
+    const v = localStorage.getItem('gridbot.' + key);
+    return v === null ? fallback : v;
+  } catch (_) { return fallback; }
+}
+function storeSet(key, value) {
+  try { localStorage.setItem('gridbot.' + key, String(value)); } catch (_) { /* ignore */ }
+}
+
+/* Compact axis money: $950, $1.2k, -$840. */
+const usdShort = (v) => {
+  const a = Math.abs(v);
+  const body = a >= 1000 ? (a / 1000).toFixed(a >= 10000 ? 0 : 1) + 'k' : Math.round(a).toString();
+  return (v < 0 ? '-$' : '$') + body;
+};
+
+/* Redraw a chart only when what it shows has changed. Snapshots land every
+   2.5s and most of them move nothing visible -- rebuilding the SVG anyway
+   would kill hover tooltips mid-read. */
+function changed(name, key) {
+  if (S.drawn[name] === key) return false;
+  S.drawn[name] = key;
+  return true;
+}
+
+/* Donut slice colours: distinct, handed out in config order so a coin keeps
+   its colour as values shift. (Hashing the ticker, as the monograms do, puts
+   too many coins on near-identical hues to tell slices apart.) */
+const SLICE_COLORS = ['#58a6ff', '#f0883e', '#2ec4b6', '#bc8cff', '#e3b341', '#f778ba',
+                      '#8ddb5a', '#79c0ff', '#ff9f8a', '#d2a8ff', '#c9a227', '#56d4dd'];
+const sliceColor = (i) => SLICE_COLORS[i % SLICE_COLORS.length];
+
+/* --- account value over time (A) ----------------------------------------- */
+
+const VALUE_RANGES = [['1D', 1], ['1W', 7], ['1M', 30], ['3M', 90], ['All', 0]];
+
+function buildValueRanges() {
+  const host = $('#value-ranges');
+  host.replaceChildren(...VALUE_RANGES.map(([label, days]) => {
+    const b = el('button', days === S.valueDays ? 'on' : '', label);
+    b.onclick = () => {
+      S.valueDays = days;
+      storeSet('valueDays', days);
+      for (const other of host.children) other.classList.toggle('on', other === b);
+      loadEquity();
+    };
+    return b;
+  }));
+}
+
+async function loadEquity() {
+  try {
+    const res = await api('/api/equity' + (S.valueDays ? `?days=${S.valueDays}` : ''));
+    S.equity = res.points;
+    S.drawn.value = null;
+    renderValue();
+  } catch (err) {
+    $('#value-chart').innerHTML = `<div class="small neg">${esc(err.message)}</div>`;
+  }
+}
+
+/* Recorded samples plus the live total as the final point, so the line and
+   the period change track the headline card instead of lagging 10 minutes. */
+function valuePoints() {
+  const pts = (S.equity || []).slice();
+  const t = S.snap && S.snap.totals;
+  if (t && t.total_value !== null && t.total_value !== undefined && !t.coins_no_price) {
+    pts.push({ ts: S.snap.ts, total: t.total_value, realized: t.realized_total, live: true });
+  }
+  return pts;
+}
+
+function periodLabel(first) {
+  const days = S.valueDays;
+  const since = new Date(first.ts * 1000);
+  // Recording hasn't covered the whole range yet: say what it does cover.
+  if (!days || first.ts > Date.now() / 1000 - days * 86400 + 3600) {
+    return 'since ' + since.toLocaleString([], { month: 'short', day: 'numeric',
+                                                 hour: 'numeric', minute: '2-digit' });
+  }
+  return { 1: 'last 24h', 7: 'last 7 days', 30: 'last 30 days', 90: 'last 90 days' }[days];
+}
+
+function renderValue() {
+  const host = $('#value-chart');
+  const head = $('#value-change');
+  const pts = valuePoints();
+  const last = pts[pts.length - 1];
+  if (!changed('value', pts.length + ':' + (last ? Math.round(last.total) : '') + ':' + host.clientWidth)) return;
+
+  if (pts.length < 2) {
+    head.textContent = '';
+    host.innerHTML = '<div class="chart-hint">Recording started. The account value is saved ' +
+      'every 10 minutes while the bot runs, so this line fills in over the next hour.</div>';
+    return;
+  }
+
+  const first = pts[0];
+  const delta = last.total - first.total;
+  const pctChange = first.total ? delta / first.total * 100 : 0;
+  const banked = (last.realized ?? 0) - (first.realized ?? 0);
+  head.innerHTML =
+    `<span class="num ${cls(delta)}">${esc(usdSigned(delta))} (${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(2)}%)</span> ` +
+    `<span class="muted">${esc(periodLabel(first))}</span>` +
+    ` <span class="dim">· bot banked <span class="num ${cls(banked)}">${esc(usdSigned(banked))}</span></span>` +
+    ` <span id="value-readout" class="dim"></span>`;
+
+  const W = Math.max(320, host.clientWidth || 900), H = 200, padL = 52, padR = 8, padT = 10, padB = 20;
+  const xs = pts.map((p) => p.ts), ys = pts.map((p) => p.total);
+  const x0 = xs[0], x1 = xs[xs.length - 1];
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const pad = Math.max((y1 - y0) * 0.12, y1 * 0.002, 1);
+  y0 -= pad; y1 += pad;
+  const sx = (t) => padL + (x1 === x0 ? 0.5 : (t - x0) / (x1 - x0)) * (W - padL - padR);
+  const sy = (v) => padT + (1 - (v - y0) / (y1 - y0)) * (H - padT - padB);
+
+  const line = pts.map((p, i) => `${i ? 'L' : 'M'}${sx(p.ts).toFixed(1)},${sy(p.total).toFixed(1)}`).join('');
+  const area = `${line}L${sx(x1).toFixed(1)},${H - padB}L${sx(x0).toFixed(1)},${H - padB}Z`;
+  const stroke = delta >= 0 ? 'var(--green)' : 'var(--red)';
+
+  const ticks = [0, 0.5, 1].map((f) => y0 + pad + f * (y1 - y0 - 2 * pad));
+  const grid = ticks.map((v) =>
+    `<line x1="${padL}" x2="${W - padR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}" stroke="var(--line)"/>` +
+    `<text x="${padL - 6}" y="${(sy(v) + 4).toFixed(1)}" text-anchor="end" class="axis">${esc(usdShort(v))}</text>`).join('');
+  const when = (ts) => new Date(ts * 1000).toLocaleString([], S.valueDays === 1
+    ? { hour: 'numeric', minute: '2-digit' } : { month: 'short', day: 'numeric' });
+
+  host.innerHTML =
+    `<svg class="chart value-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">` +
+      `<defs><linearGradient id="vg" x1="0" x2="0" y1="0" y2="1">` +
+        `<stop offset="0%" stop-color="${stroke}" stop-opacity=".22"/>` +
+        `<stop offset="100%" stop-color="${stroke}" stop-opacity="0"/>` +
+      `</linearGradient></defs>` +
+      grid +
+      `<line x1="${sx(x0).toFixed(1)}" x2="${W - padR}" y1="${sy(first.total).toFixed(1)}" ` +
+        `y2="${sy(first.total).toFixed(1)}" stroke="var(--line-2)" stroke-dasharray="3 4"/>` +
+      `<path d="${area}" fill="url(#vg)"/>` +
+      `<path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.8" stroke-linejoin="round"/>` +
+      `<text x="${padL}" y="${H - 4}" class="axis">${esc(when(x0))}</text>` +
+      `<text x="${W - padR}" y="${H - 4}" text-anchor="end" class="axis">${esc(when(x1))}</text>` +
+      `<line class="cross" y1="${padT}" y2="${H - padB}" stroke="var(--muted)" stroke-dasharray="2 3" visibility="hidden"/>` +
+      `<circle class="cross" r="3.5" fill="${stroke}" visibility="hidden"/>` +
+    `</svg>`;
+
+  // Hover crosshair: nearest sample by time, value in the header readout.
+  const svg = host.firstChild;
+  const [vline, vdot] = svg.querySelectorAll('.cross');
+  const readout = $('#value-readout');
+  svg.onmousemove = (e) => {
+    const r = svg.getBoundingClientRect();
+    const t = x0 + ((e.clientX - r.left) * (W / r.width) - padL) / (W - padL - padR) * (x1 - x0);
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p.ts - t) < Math.abs(best.ts - t)) best = p;
+    const cx = sx(best.ts).toFixed(1), cy = sy(best.total).toFixed(1);
+    vline.setAttribute('x1', cx); vline.setAttribute('x2', cx);
+    vdot.setAttribute('cx', cx); vdot.setAttribute('cy', cy);
+    vline.setAttribute('visibility', 'visible'); vdot.setAttribute('visibility', 'visible');
+    const stamp = new Date(best.ts * 1000).toLocaleString([], { month: 'short', day: 'numeric',
+                                                                hour: 'numeric', minute: '2-digit' });
+    readout.textContent = `· ${best.live ? 'now' : stamp}: ${usd(best.total)}`;
+  };
+  svg.onmouseleave = () => {
+    vline.setAttribute('visibility', 'hidden'); vdot.setAttribute('visibility', 'hidden');
+    readout.textContent = '';
+  };
+}
+
+/* --- realized profit by period (B) --------------------------------------- */
+
+function renderPeriods(h) {
+  const trades = (h && h.cumulative) || [];
+  const now = Date.now() / 1000;
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const windowStats = (since) => {
+    let sum = 0, n = 0;
+    for (const p of trades) if (p.ts >= since) { sum += p.realized; n += 1; }
+    return { sum, n };
+  };
+  const today = windowStats(midnight.getTime() / 1000);
+  const week = windowStats(now - 7 * 86400);
+  const month = windowStats(now - 30 * 86400);
+
+  // Best calendar day in the last 30 (local time).
+  const byDay = new Map();
+  for (const p of trades) {
+    if (p.ts < now - 30 * 86400) continue;
+    const d = new Date(p.ts * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    byDay.set(d, (byDay.get(d) || 0) + p.realized);
+  }
+  let best = null;
+  for (const [day, v] of byDay) if (!best || v > best.v) best = { day, v };
+
+  const scope = S.chartScope ? S.chartScope.split('/')[0] + ' · ' : '';
+  const sells = (n) => `${n} sell${n === 1 ? '' : 's'}`;
+  renderCards($('#periods'), 'pcard:', [
+    { id: 'today', k: scope + 'Realized today', v: usdSigned(today.sum), c: cls(today.sum),
+      sub: sells(today.n) },
+    { id: 'week', k: scope + 'Last 7 days', v: usdSigned(week.sum), c: cls(week.sum),
+      sub: `${sells(week.n)} · ${usdSigned(week.sum / 7)}/day` },
+    { id: 'month', k: scope + 'Last 30 days', v: usdSigned(month.sum), c: cls(month.sum),
+      sub: `${sells(month.n)} · ${usdSigned(month.sum / 30)}/day` },
+    { id: 'best', k: scope + 'Best day · 30d', v: best ? usdSigned(best.v) : '—',
+      c: best ? cls(best.v) : '', sub: best ? best.day : 'no sells in 30 days' },
+  ]);
+}
+
+/* --- where the money is (D) ---------------------------------------------- */
+
+function allocationSlices(snap) {
+  const t = snap.totals;
+  const items = [];
+  if (t.cash_usd) items.push({ name: 'Cash (USD)', value: t.cash_usd, color: '#6e7681' });
+  snap.coins.forEach((c, i) => {
+    const value = (c.wallet_qty !== null && c.price !== null)
+      ? c.wallet_qty * c.price : (c.position_value || 0);
+    items.push({ name: c.base, value, color: sliceColor(i), symbol: c.symbol });
+  });
+  (t.other_assets || []).forEach((o, i) => {
+    if (o.value !== null) {
+      items.push({ name: o.asset, value: o.value, color: sliceColor(snap.coins.length + i) });
+    }
+  });
+  const total = items.reduce((a, i) => a + i.value, 0);
+  const kept = [], small = [];
+  for (const i of items.filter((i) => i.value >= 1).sort((a, b) => b.value - a.value)) {
+    (i.name === 'Cash (USD)' || i.value / total >= 0.02 ? kept : small).push(i);
+  }
+  if (small.length === 1) kept.push(small[0]);
+  else if (small.length) {
+    kept.push({ name: `${small.length} others`, color: '#3a434f',
+                value: small.reduce((a, i) => a + i.value, 0),
+                detail: small.map((i) => `${i.name} ${usd(i.value)}`).join(', ') });
+  }
+  return { slices: kept, total };
+}
+
+function renderAlloc(snap) {
+  const host = $('#alloc');
+  const { slices, total } = allocationSlices(snap);
+  if (!changed('alloc', slices.map((s) => s.name + Math.round(s.value)).join('|') + S.open)) return;
+  if (!total) {
+    host.innerHTML = '<div class="chart-hint">No balances yet.</div>';
+    return;
+  }
+
+  const R = 92, r = 58, C = 100;
+  const pt = (a, rad) => `${(C + rad * Math.sin(a)).toFixed(2)},${(C - rad * Math.cos(a)).toFixed(2)}`;
+  let angle = 0;
+  const arcs = slices.map((sl) => {
+    // A lone 100% slice can't be drawn as one arc -- nudge it just short.
+    const sweep = Math.min(sl.value / total, 0.99999) * Math.PI * 2;
+    const a0 = angle, a1 = angle + sweep;
+    angle = a1;
+    const big = sweep > Math.PI ? 1 : 0;
+    const d = `M${pt(a0, R)}A${R},${R} 0 ${big} 1 ${pt(a1, R)}L${pt(a1, r)}A${r},${r} 0 ${big} 0 ${pt(a0, r)}Z`;
+    const share = (sl.value / total * 100).toFixed(1);
+    const tip = `${sl.name}: ${usd(sl.value)} (${share}%)` + (sl.detail ? `\n${sl.detail}` : '');
+    return `<path class="slice${sl.symbol ? ' coin' : ''}" d="${d}" fill="${sl.color}" ` +
+      `stroke="var(--panel)" stroke-width="1.5" data-symbol="${esc(sl.symbol || '')}">` +
+      `<title>${esc(tip)}</title></path>`;
+  }).join('');
+
+  host.innerHTML =
+    `<div class="alloc">` +
+      `<svg viewBox="0 0 200 200">${arcs}` +
+        `<text x="100" y="98" text-anchor="middle" class="donut-v">${esc(usdShort(total))}</text>` +
+        `<text x="100" y="116" text-anchor="middle" class="donut-k">total</text>` +
+      `</svg>` +
+      `<div class="legend">` + slices.map((sl) =>
+        `<div class="row${sl.symbol ? ' coin' : ''}" data-symbol="${esc(sl.symbol || '')}"` +
+          (sl.detail ? ` title="${esc(sl.detail)}"` : '') + `>` +
+          `<span class="sw" style="background:${sl.color}"></span>` +
+          `<span class="name">${esc(sl.name)}</span>` +
+          `<span class="amt">${esc(usdShort(sl.value))} · ${(sl.value / total * 100).toFixed(0)}%</span>` +
+        `</div>`).join('') +
+      `</div>` +
+    `</div>`;
+  for (const node of host.querySelectorAll('[data-symbol]')) {
+    if (node.dataset.symbol) node.onclick = () => openCoin(node.dataset.symbol);
+  }
+}
+
+/* --- coin performance quadrant (1) --------------------------------------- */
+
+function renderQuadrant(snap) {
+  const host = $('#quadrant');
+  const coins = snap.coins.map((c) => ({
+    symbol: c.symbol, base: c.base,
+    x: c.realized || 0,
+    y: c.unrealized || 0,
+    value: (c.wallet_qty !== null && c.price !== null) ? c.wallet_qty * c.price : (c.position_value || 0),
+  }));
+  const W = Math.max(300, host.clientWidth || 600), H = 280;
+  const key = coins.map((c) => `${c.base}${Math.round(c.x)},${Math.round(c.y)},${Math.round(c.value / 20)}`).join('|');
+  if (!changed('quad', key + S.open + W)) return;
+  if (!coins.length) {
+    host.innerHTML = '<div class="chart-hint">No active coins.</div>';
+    return;
+  }
+
+  const padL = 46, padR = 14, padT = 12, padB = 24;
+  let xa = Math.min(0, ...coins.map((c) => c.x)), xb = Math.max(0, ...coins.map((c) => c.x));
+  let ya = Math.min(0, ...coins.map((c) => c.y)), yb = Math.max(0, ...coins.map((c) => c.y));
+  const px = Math.max((xb - xa) * 0.08, 20), py = Math.max((yb - ya) * 0.12, 20);
+  xa -= xa < 0 ? px : px * 0.4; xb += px;
+  ya -= py; yb += py;
+  const sx = (v) => padL + (v - xa) / (xb - xa) * (W - padL - padR);
+  const sy = (v) => padT + (1 - (v - ya) / (yb - ya)) * (H - padT - padB);
+  const maxV = Math.max(...coins.map((c) => c.value), 1);
+  const rad = (v) => 4 + 9 * Math.sqrt(Math.max(v, 0) / maxV);
+
+  const niceTicks = (a, b) => {
+    const step0 = (b - a) / 4;
+    const mag = 10 ** Math.floor(Math.log10(step0));
+    const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= step0);
+    const out = [];
+    for (let v = Math.ceil(a / step) * step; v <= b; v += step) out.push(Math.round(v * 100) / 100);
+    return out;
+  };
+  const grid =
+    niceTicks(xa, xb).map((v) =>
+      `<line x1="${sx(v).toFixed(1)}" x2="${sx(v).toFixed(1)}" y1="${padT}" y2="${H - padB}" stroke="${v === 0 ? 'var(--line-2)' : 'var(--line)'}" stroke-opacity="${v === 0 ? 1 : .5}"/>` +
+      `<text x="${sx(v).toFixed(1)}" y="${H - 6}" text-anchor="middle" class="axis">${esc(usdShort(v))}</text>`).join('') +
+    niceTicks(ya, yb).map((v) =>
+      `<line x1="${padL}" x2="${W - padR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}" stroke="${v === 0 ? 'var(--line-2)' : 'var(--line)'}" stroke-opacity="${v === 0 ? 1 : .5}"/>` +
+      `<text x="${padL - 6}" y="${(sy(v) + 4).toFixed(1)}" text-anchor="end" class="axis">${esc(usdShort(v))}</text>`).join('');
+
+  // Corner captions, only for quadrants the axes actually show.
+  const x0 = sx(0), y0 = sy(0);
+  const q = [];
+  if (y0 > padT + 18) q.push([W - padR - 4, padT + 12, 'end', 'banked · in profit now']);
+  if (y0 < H - padB - 14) q.push([W - padR - 4, H - padB - 6, 'end', 'banked · underwater now']);
+  if (x0 > padL + 150 && y0 < H - padB - 14) q.push([padL + 4, H - padB - 6, 'start', 'losing · underwater']);
+  const captions = q.map(([x, y, anchor, t]) =>
+    `<text x="${x}" y="${y}" text-anchor="${anchor}" class="qlabel">${t}</text>`).join('');
+
+  // Dots, largest first so small ones stay clickable on top.
+  const order = coins.slice().sort((a, b) => b.value - a.value);
+  const dots = order.map((c) => {
+    const tip = `${c.symbol}\nbanked ${usdSigned(c.x)}\nholding now ${usdSigned(c.y)}\n` +
+                `net ${usdSigned(c.x + c.y)}\nposition ${usd(c.value)}`;
+    const color = c.y < 0 ? 'var(--red)' : 'var(--blue)';
+    const open = S.open === c.symbol;
+    return `<g class="dotc" data-symbol="${esc(c.symbol)}">` +
+      `<circle cx="${sx(c.x).toFixed(1)}" cy="${sy(c.y).toFixed(1)}" r="${rad(c.value).toFixed(1)}" ` +
+        `fill="${color}" fill-opacity="${open ? .95 : .7}" stroke="${open ? 'var(--text)' : 'var(--panel)'}" ` +
+        `stroke-width="${open ? 2 : 1.5}"/>` +
+      `<title>${esc(tip)}</title></g>`;
+  }).join('');
+
+  // Labels right of each dot; nudge down (then up) past earlier labels, and
+  // drop a label rather than let two overlap -- the tooltip still has it.
+  const placed = [];
+  const labels = coins.slice().sort((a, b) => sy(a.y) - sy(b.y)).map((c) => {
+    const w = c.base.length * 6.8 + 4, h = 12;
+    let lx = sx(c.x) + rad(c.value) + 3;
+    if (lx + w > W - padR) lx = sx(c.x) - rad(c.value) - 3 - w;
+    const base = sy(c.y) + 4;
+    for (const dy of [0, 10, -10, 20, -20]) {
+      const ly = base + dy;
+      const box = { x: lx, y: ly - h + 2, w, h };
+      if (!placed.some((p) => box.x < p.x + p.w && p.x < box.x + box.w && box.y < p.y + p.h && p.y < box.y + box.h)) {
+        placed.push(box);
+        return `<text x="${lx.toFixed(1)}" y="${ly.toFixed(1)}"${S.open === c.symbol ? ' class="sel"' : ''}>${esc(c.base)}</text>`;
+      }
+    }
+    return '';
+  }).join('');
+
+  host.innerHTML =
+    `<div class="quad"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">` +
+      grid + captions + dots + labels +
+    `</svg>` +
+    `<div class="small dim" style="display:flex;justify-content:space-between;margin-top:2px">` +
+      `<span>↑ unrealized (holding now)</span><span>realized (banked) →</span></div></div>`;
+  for (const g of host.querySelectorAll('.dotc')) g.onclick = () => openCoin(g.dataset.symbol);
+}
+
 /* --- chart --------------------------------------------------------------- */
 
 function renderChart() {
@@ -1326,6 +1727,7 @@ function renderChart() {
     : `all coins — ${h ? h.count : 0} closed sells`;
   $('#btn-chart-all').style.display = S.chartScope ? '' : 'none';
 
+  renderPeriods(h);
   if (!h || !h.cumulative.length) {
     host.innerHTML = '<div class="muted small">No closed sells found in the logs yet.</div>';
     return;
@@ -1423,6 +1825,9 @@ function render() {
   if (!S.snap || !S.meta) return;
   renderHeader(S.snap);
   renderTotals(S.snap);
+  renderAlloc(S.snap);
+  renderQuadrant(S.snap);
+  renderValue();
   renderCoins(S.snap);
   renderInactive(S.snap);
 }
@@ -1661,12 +2066,18 @@ async function boot() {
     document.body.innerHTML = `<main><p class="neg">${esc(err.message)}</p></main>`;
     return;
   }
+  S.valueDays = Number(storeGet('valueDays', 7));
+  buildValueRanges();
+  window.addEventListener('resize', () => { S.drawn = {}; render(); });
+
   await refresh();
   await loadHistory();
+  await loadEquity();
   await loadLog();
 
   setInterval(() => { if (S.polling) refresh(); }, POLL_MS);
   setInterval(() => { if (S.polling) loadHistory(); }, HISTORY_MS);
+  setInterval(() => { if (S.polling) loadEquity(); }, 60000);
   setInterval(() => { if (S.polling && S.logFollow) loadLog(); }, 6000);
 }
 

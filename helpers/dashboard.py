@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
-from . import icons, trade_history
+from . import equity, icons, trade_history
 from .actions import (
     ACTIONS,
     LOCAL_KINDS,
@@ -380,6 +380,13 @@ def build_snapshot(ctx: DashboardContext) -> dict:
     # rather than as zero, which would understate the portfolio.
     cash = ctx.balance_holder.get("usd") if ctx.mode == "live" else ctx.wallet.usd
 
+    # Everything else on the exchange: stablecoins, coins no grid trades, staked
+    # balances. Without it the total silently disagrees with Kraken's.
+    other = ctx.balance_holder.get("other") or {} if ctx.mode == "live" else {}
+    other_value = sum(o["value"] for o in other.values() if o["value"] is not None)
+    other_assets = sorted(({"asset": a, **o} for a, o in other.items()),
+                          key=lambda o: -(o["value"] or 0.0))
+
     balance_ts = ctx.balance_holder.get("ts") or 0.0
     return {
         "ts": time.time(),
@@ -404,7 +411,10 @@ def build_snapshot(ctx: DashboardContext) -> dict:
             "holdings_value": holdings_value,      # coins, at the last tick price
             "holdings_basis": holdings_basis,      # "wallet" (real balances) | "tracked"
             "untracked_value": untracked_value,    # held but outside any grid
-            "total_value": None if cash is None else cash + holdings_value,
+            "other_value": other_value,            # non-grid assets (USDT, staked, ...)
+            "other_assets": other_assets,
+            "other_unpriced": [o["asset"] for o in other_assets if o["value"] is None],
+            "total_value": None if cash is None else cash + holdings_value + other_value,
             "coins_valued_from_wallet": valued_from_wallet,
             "coins_no_price": sum(1 for c in coins if c["price"] is None),
             "inactive_holding": sum(1 for c in inactive if (c.get("qty") or 0) > 0),
@@ -1012,6 +1022,15 @@ def _make_app(ctx: DashboardContext):
         result = reload_apply(ctx, str(body.get("id", "")))
         return web.json_response(result, status=200 if result["ok"] else 400)
 
+    @routes.get("/api/equity")
+    async def equity_history(request):
+        try:
+            days = float(request.query.get("days") or 0) or None
+        except ValueError:
+            raise web.HTTPBadRequest(text="days must be a number")
+        points = await asyncio.to_thread(equity.load, days)
+        return web.json_response({"points": points, "every_sec": equity.EQUITY_EVERY_SEC})
+
     @routes.get("/api/history")
     async def history(request):
         symbol = request.query.get("symbol") or None
@@ -1056,6 +1075,9 @@ this browser:</p>
 """
 
 
+_background: set = set()   # long-lived tasks start() owns
+
+
 async def start(ctx: DashboardContext, host: str = DASHBOARD_HOST,
                 port: int = DASHBOARD_PORT):
     """Start the dashboard. Returns an AppRunner to clean up, or None.
@@ -1094,6 +1116,9 @@ async def start(ctx: DashboardContext, host: str = DASHBOARD_HOST,
     # Warm the trade-history cache now, in a thread: pay the one big log parse
     # during startup instead of inside the first dashboard request.
     asyncio.create_task(asyncio.to_thread(trade_history.summary))
+    # Account value over time. Referenced from module scope so it isn't
+    # garbage-collected; it dies with the event loop at shutdown.
+    _background.add(asyncio.create_task(equity.recorder(lambda: build_snapshot(ctx))))
 
     shown = "localhost" if loopback else host
     suffix = f"/?token={DASHBOARD_TOKEN[:4]}..." if DASHBOARD_TOKEN else "/"

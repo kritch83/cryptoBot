@@ -28,7 +28,34 @@
     <div id="totals" class="cards"></div>
   </section>
 
+  <section id="value-sec">
+    <div class="panel" style="padding:14px 16px">
+      <div class="chart-head">
+        <h2 style="margin:0">Account value</h2>
+        <span id="value-change" class="small"></span>
+        <span class="spacer" style="flex:1"></span>
+        <span id="value-ranges" class="seg"></span>
+      </div>
+      <div id="value-chart"></div>
+    </div>
+  </section>
+
+  <section id="mix-sec" class="mix">
+    <div class="panel" style="padding:14px 16px">
+      <div class="chart-head"><h2 style="margin:0">Where the money is</h2></div>
+      <div id="alloc"></div>
+    </div>
+    <div class="panel" style="padding:14px 16px">
+      <div class="chart-head">
+        <h2 style="margin:0">Coin performance</h2>
+        <span class="dim small">banked vs. holding now · dot size = position value · click a dot</span>
+      </div>
+      <div id="quadrant"></div>
+    </div>
+  </section>
+
   <section id="chart-sec">
+    <div id="periods" class="cards" style="margin-bottom:10px"></div>
     <div class="panel" style="padding:14px 16px">
       <div class="chart-head">
         <h2 style="margin:0">Realized PnL <span class="dim small">from logs</span></h2>

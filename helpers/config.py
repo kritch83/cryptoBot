@@ -106,7 +106,7 @@ COINS = [
         "symbol":          	"ZEC/USD",
         "price_prec":      	2,
         "drop_pct":        	0.05,
-        "trail_buy_pct":   	0.02,
+        "trail_buy_pct":   	0.008,
         "trail_sell_pct":  	0.008,
         "buy_order_type":       "limit",
         "limit_buy_offset_pct": 0.00003,
