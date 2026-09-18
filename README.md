@@ -28,7 +28,6 @@ trailing entry/exit state machines.
 
 
 
-
 #### ⚠️ This places orders with real money when run with `--live`
 
 
@@ -70,39 +69,31 @@ lifetime PnL in the totals after its state is wiped.
 ```bash
 git clone https://github.com/kritch83/cryptoBot.git && cd cryptoBot
 ```
-<br></br>
 
 2. Install python3
 ```bash
 sudo apt install -y python3-dev python3-pip
 ```
 
-<br></br>
-
 3. Create virtual environment
 ```bash
 python3 -m venv env && source venv/bin/activate
 ```
 
-<br></br>
-
 4. Install python & python libs
 ```bash
 pip3 install -r helpers/requirements.txt
 ```
-<br></br>
 
 5. Copy example env to .env & fill in with your keys/info
 ```bash
 cp env.example .env && nano .env
 ```
-<br></br>
 
 6. Edit the `COINS` list in `config.py` with your coins
 ```bash
 nano helpers/config.py
 ```
-<br></br>
 
 7. Then run **from the project root** (all paths are relative to it) one of two commands:
 <h5>paper mode:</h5>
