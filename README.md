@@ -87,13 +87,14 @@ pip3 install -r helpers/requirements.txt
 
 5. Copy example env to .env & fill in with your keys/info
 ```bash
-cp env.example .env && nano .env
+cp .env.example .env && nano .env
 ```
 
-6. Edit the `COINS` list in `config.py` with your coins
+6. Copy the example config & edit the `COINS` list with your coins
 ```bash
-nano helpers/config.py
+cp helpers/config.example.py helpers/config.py && nano helpers/config.py
 ```
+`helpers/config.py` is git-ignored, so your coin settings stay out of the repo.
 
 7. Then run **from the project root** (all paths are relative to it) one of two commands:
 <h5>paper mode:</h5>
@@ -205,7 +206,7 @@ one **on** also take effect immediately from the dashboard.
 running, and the module-level constants (fees, `ACTION_COOLDOWN_SEC`,
 `PAPER_STARTING_USD`, notification and dashboard settings).
 
-Secrets go in `.env`, never in `config.py` — see [`env.example`](env.example).
+Secrets go in `.env`, never in `config.py` — see [`.env.example`](.env.example).
 
 ### <img src="images/graph.png" height="50" align="absmiddle">Layout
 
@@ -213,7 +214,8 @@ Secrets go in `.env`, never in `config.py` — see [`env.example`](env.example).
 conductor.py            entry point: CLI, terminal menu, task orchestration
 helpers/
   coin_runner.py        per-coin tick loop, trail state machines, order execution
-  config.py             COINS + all settings
+  config.py             COINS + all settings (git-ignored; yours)
+  config.example.py     template for config.py
   config_reload.py      hot reload, read side (parse → diff → apply in memory)
   config_edit.py        hot reload, write side (AST-surgical edits to config.py)
   actions.py            action catalog + validators shared by both front-ends

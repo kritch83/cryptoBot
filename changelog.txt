@@ -720,3 +720,14 @@ Oct 15 - mobile fix: coin detail panel
     open-levels table / config form, ~610px), so the block grid inside saw
     642px and fit two columns. Fixed with grid-template-columns: minmax(0, 1fr)
     on .detail-wrap; the open-levels table now scrolls inside its own block.
+
+Oct 15 - helpers/config.py is now git-ignored
+  - The repo is public and the dashboard's config editor writes live coin
+    settings into config.py, so it kept showing up in commits. It is now in
+    .gitignore and untracked (the file on disk is untouched).
+  - New helpers/config.example.py: the full settings file with two example
+    coins in COINS. Fresh clones: cp helpers/config.example.py helpers/config.py
+  - conductor.py exits with that instruction if config.py is missing, instead
+    of an import traceback.
+  - README setup steps updated; also fixed the env template name there
+    (.env.example, not env.example).

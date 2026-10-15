@@ -26,6 +26,11 @@ from typing import Optional
 
 import ccxt
 import ccxt.pro as ccxtpro
+from pathlib import Path
+
+if not (Path(__file__).resolve().parent / "helpers" / "config.py").exists():
+    sys.exit("helpers/config.py not found -- it is git-ignored, so a fresh clone has none.\n"
+             "Start one from the template:  cp helpers/config.example.py helpers/config.py")
 
 from helpers import dashboard
 from helpers.actions import (

@@ -2,6 +2,10 @@
 # NEVER commit this file.
 .env
 
+# Your live coin settings. Copy helpers/config.example.py to start one; the
+# dashboard's config editor writes here, so it changes constantly.
+helpers/config.py
+
 # Live trading state: positions, balances, PnL, full activity log.
 data/
 
