@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,17 @@ _SELL_RE = re.compile(
     r"cycle=(?P<cycle>\d+)\s+\((?P<reason>.*)\)\s*$"
 )
 
+# One booked buy, for the fee total. Both tags that reach _finalize_buy: "BUY"
+# (market / force-buy) and "LIMIT-BUY FILL". Requiring fee= and cost= keeps the
+# "BUY-TRAIL ARMED level=..." lines, which carry neither, from matching.
+_BUY_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+\s+\w+\s+"
+    r"\[(?P<symbol>[^\]]+)\]\s+\[(?P<mode>[A-Z-]+)\]\s+(?P<tag>[A-Z][A-Z -]*?)\s+"
+    r"level=(?P<level>\d+)\s+price=\$(?P<price>[\d,.]+)\s+qty=(?P<qty>[\d.]+)\s+"
+    r"fee=\$(?P<fee>[-\d,.]+)\s+cost=\$(?P<cost>[-\d,.]+)\s+"
+    r"avg_entry=\$(?P<avg_entry>[\d,.]+)\s+\((?P<reason>.*)\)\s*$"
+)
+
 # path -> {"key": (inode, size), "offset": int, "trades": [...]}
 _cache: dict[str, dict] = {}
 
@@ -51,20 +63,52 @@ def _num(text: str) -> float:
     return float(text.replace(",", ""))
 
 
+def _stamp(text: str) -> Optional[float]:
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 def _parse_lines(lines) -> list[dict]:
+    """Booked fills from these lines: sells (kind "sell") and buys (kind "buy").
+
+    Buys carry only what the fee total needs; the charts read sells, which keep
+    every field they always had.
+    """
     out: list[dict] = []
     for line in lines:
+        if "fee=$" not in line:
+            continue
         if "realized=" not in line:
+            m = _BUY_RE.match(line)
+            ts = _stamp(m["ts"]) if m else None
+            if ts is not None:
+                out.append({
+                    "kind":     "buy",
+                    "ts":       ts,
+                    "time":     m["ts"],
+                    "symbol":   m["symbol"],
+                    "mode":     m["mode"].lower(),
+                    "tag":      m["tag"].strip(),
+                    "level":    int(m["level"]),
+                    "price":    _num(m["price"]),
+                    "qty":      _num(m["qty"]),
+                    "fee_usd":  _num(m["fee"]),
+                    "cost_usd": _num(m["cost"]),
+                    "reason":   m["reason"],
+                })
             continue
         m = _SELL_RE.match(line)
         if m is None:
             continue
-        try:
-            stamp = datetime.strptime(m["ts"], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
+        stamp = _stamp(m["ts"])
+        if stamp is None:
             continue
         out.append({
-            "ts":       stamp.replace(tzinfo=timezone.utc).timestamp(),
+            "kind":     "sell",
+            "ts":       stamp,
             "time":     m["ts"],
             "symbol":   m["symbol"],
             "mode":     m["mode"].lower(),
@@ -85,7 +129,7 @@ def _parse_lines(lines) -> list[dict]:
 
 
 def _read_file(path: Path) -> list[dict]:
-    """Trades from one log file, re-reading only what was appended since last time."""
+    """Fills from one log file, re-reading only what was appended since last time."""
     key_path = str(path)
     try:
         stat = path.stat()
@@ -127,25 +171,62 @@ def _log_files() -> list[Path]:
     return [*rotated, live]
 
 
-def all_trades(symbol: Optional[str] = None) -> list[dict]:
-    """Every booked sell across all log files, oldest first.
+def all_fills(kind: str, symbol: Optional[str] = None) -> list[dict]:
+    """Every booked fill of one kind ("sell" / "buy") across the logs, oldest first.
 
     Duplicates are possible in principle (a log line copied by a rotation race),
-    so identical (ts, symbol, cycle, realized) tuples are collapsed.
+    so identical fills are collapsed on the fields that identify one.
     """
     seen: set = set()
     trades: list[dict] = []
     for path in _log_files():
         for trade in _read_file(path):
+            if trade["kind"] != kind:
+                continue
             if symbol is not None and trade["symbol"] != symbol:
                 continue
-            fingerprint = (trade["ts"], trade["symbol"], trade["cycle"], trade["realized"])
+            fingerprint = ((trade["ts"], trade["symbol"], trade["cycle"], trade["realized"])
+                           if kind == "sell" else
+                           (trade["ts"], trade["symbol"], trade["level"], trade["cost_usd"]))
             if fingerprint in seen:
                 continue
             seen.add(fingerprint)
             trades.append(trade)
     trades.sort(key=lambda t: t["ts"])
     return trades
+
+
+def all_trades(symbol: Optional[str] = None) -> list[dict]:
+    """Every booked sell across all log files, oldest first."""
+    return all_fills("sell", symbol)
+
+
+def fee_totals(symbol: Optional[str] = None) -> dict:
+    """What trading has cost in exchange fees, recovered from the logs.
+
+    Both sides count: a buy's fee is already inside its cost basis and a sell's
+    is already out of its proceeds, so realized PnL is net of all of this -- the
+    total is what was paid to trade, not a further deduction.
+
+    Like every other figure from this module it covers only what is STILL in the
+    logs; `since` is the oldest fill found, so the dashboard can say so.
+    """
+    buys = all_fills("buy", symbol)
+    sells = all_fills("sell", symbol)
+    month_ago = time.time() - 30 * 86400
+    buy_fees = sum(t["fee_usd"] for t in buys)
+    sell_fees = sum(t["fee_usd"] for t in sells)
+    stamps = [t["ts"] for t in (buys[:1] + sells[:1])]
+    return {
+        "symbol":   symbol,
+        "total":    buy_fees + sell_fees,
+        "buy":      buy_fees,
+        "sell":     sell_fees,
+        "buys":     len(buys),
+        "sells":    len(sells),
+        "last_30d": sum(t["fee_usd"] for t in (*buys, *sells) if t["ts"] >= month_ago),
+        "since":    min(stamps) if stamps else None,
+    }
 
 
 def summary(symbol: Optional[str] = None, limit: int = 200) -> dict:

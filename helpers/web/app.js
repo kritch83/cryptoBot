@@ -16,6 +16,7 @@ const S = {
   history: null,       // /api/history for the current chart scope
   chartScope: null,    // null = all coins
   equity: null,        // /api/equity points for the selected range
+  fees: null,          // /api/fees totals, account-wide
   valueDays: null,     // account-value range in days, 0 = all (see VALUE_RANGES)
   drawn: {},           // chart -> data key last drawn, to skip identical redraws
   sort: { key: 'index', dir: 1 },
@@ -488,6 +489,26 @@ function accountCard(snap) {
   };
 }
 
+/* Exchange fees paid, from the logs. Not a deduction to make: a buy's fee is
+   already inside its cost basis and a sell's is already out of its proceeds, so
+   realized PnL is net of every dollar counted here. */
+function feesCard() {
+  const f = S.fees;
+  if (!f) return { id: 'fees', k: 'Fees paid', v: '—', sub: 'reading the logs…' };
+  const since = f.since
+    ? new Date(f.since * 1000).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+    : null;
+  return {
+    id: 'fees', k: 'Fees paid', v: usd(f.total),
+    sub: `${f.buys} buys · ${f.sells} sells · ${usd(f.last_30d)} last 30d`,
+    title: 'Kraken fees on every booked buy and sell found in the logs' +
+      (since ? ` (back to ${since})` : '') + '.\n\n' +
+      `Buys ${usd(f.buy)} + sells ${usd(f.sell)}. Already deducted from realized ` +
+      'PnL — a buy\'s fee sits in its cost basis, a sell\'s comes off its proceeds — ' +
+      'so this is what trading cost, not a further subtraction.',
+  };
+}
+
 function renderTotals(snap) {
   const t = snap.totals;
   // The account total is the headline and it is real assets only. The old
@@ -502,6 +523,7 @@ function renderTotals(snap) {
            `${t.coins_holding} coin(s)` },
     { k: 'Unrealized', v: usdSigned(t.unrealized), c: cls(t.unrealized),
       sub: 'mark-to-market — not banked, not in the account total' },
+    feesCard(),
   ];
 
   renderCards($('#totals'), 'tcard:', cards);
@@ -1506,6 +1528,13 @@ function renderValue() {
   };
 }
 
+async function loadFees() {
+  try {
+    S.fees = await api('/api/fees');
+    if (S.snap) renderTotals(S.snap);
+  } catch (_) { /* the card just stays as it was */ }
+}
+
 /* --- realized profit by period (B) --------------------------------------- */
 
 function renderPeriods(h) {
@@ -1520,16 +1549,7 @@ function renderPeriods(h) {
   const today = windowStats(midnight.getTime() / 1000);
   const week = windowStats(now - 7 * 86400);
   const month = windowStats(now - 30 * 86400);
-
-  // Best calendar day in the last 30 (local time).
-  const byDay = new Map();
-  for (const p of trades) {
-    if (p.ts < now - 30 * 86400) continue;
-    const d = new Date(p.ts * 1000).toLocaleDateString([], { month: 'short', day: 'numeric' });
-    byDay.set(d, (byDay.get(d) || 0) + p.realized);
-  }
-  let best = null;
-  for (const [day, v] of byDay) if (!best || v > best.v) best = { day, v };
+  const quarter = windowStats(now - 90 * 86400);
 
   const scope = S.chartScope ? S.chartScope.split('/')[0] + ' · ' : '';
   const sells = (n) => `${n} sell${n === 1 ? '' : 's'}`;
@@ -1540,8 +1560,8 @@ function renderPeriods(h) {
       sub: `${sells(week.n)} · ${usdSigned(week.sum / 7)}/day` },
     { id: 'month', k: scope + 'Last 30 days', v: usdSigned(month.sum), c: cls(month.sum),
       sub: `${sells(month.n)} · ${usdSigned(month.sum / 30)}/day` },
-    { id: 'best', k: scope + 'Best day · 30d', v: best ? usdSigned(best.v) : '—',
-      c: best ? cls(best.v) : '', sub: best ? best.day : 'no sells in 30 days' },
+    { id: 'quarter', k: scope + 'Last 90 days', v: usdSigned(quarter.sum), c: cls(quarter.sum),
+      sub: `${sells(quarter.n)} · ${usdSigned(quarter.sum / 90)}/day` },
   ]);
 }
 
@@ -2073,11 +2093,12 @@ async function boot() {
   await refresh();
   await loadHistory();
   await loadEquity();
+  await loadFees();
   await loadLog();
 
   setInterval(() => { if (S.polling) refresh(); }, POLL_MS);
   setInterval(() => { if (S.polling) loadHistory(); }, HISTORY_MS);
-  setInterval(() => { if (S.polling) loadEquity(); }, 60000);
+  setInterval(() => { if (S.polling) { loadEquity(); loadFees(); } }, 60000);
   setInterval(() => { if (S.polling && S.logFollow) loadLog(); }, 6000);
 }
 

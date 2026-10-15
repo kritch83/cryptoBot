@@ -128,14 +128,15 @@ http://[hostIP]:8787/?token=DASHBOARD_TOKEN; the token is kept in a cookie after
 
 - Account total (cash + coins + any other assets such as USDT, at market — real
   assets, no unrealized PnL), realized PnL, position value and unrealized as
-  separate cards.
+  separate cards, plus total fees paid (both sides of every booked trade in the
+  logs — already deducted from realized PnL).
 - Account value over time (1D / 1W / 1M / 3M / All), recorded every 10 minutes
   to `data/equity_history.jsonl`, with the period change and how much of it the
   bot banked.
 - "Where the money is" donut (cash vs. each coin) and a coin-performance
   quadrant: realized (banked) vs. unrealized (holding now) per coin, dot size =
   position value. Click a slice or dot to open that coin.
-- Realized profit today / last 7 days / last 30 days / best day, above the
+- Realized profit today / last 7 days / last 30 days / last 90 days, above the
   profit-history chart.
 - Per-coin table: price, levels, avg entry, position value, unrealized, realized,
   cycles, next buy/sell with distance from current price, and status badges.

@@ -168,8 +168,15 @@ tbody tr.detail td { padding: 0; border-bottom: 1px solid var(--line); backgroun
 .detail-head .idx { font-size: 12px; }
 .spacer { flex: 1; }
 
+/* minmax(0, 1fr), not the implicit `auto` column: an auto track can't shrink
+   below its widest child's min-content (the open-levels table, the config
+   form), which on a phone stretched the whole panel past the screen and let the
+   grid below fit two blocks side by side -- pushing "Next buy / sell" off to
+   the right. Clamped, wide content scrolls inside its own block instead. */
 .detail-wrap { padding: 16px 18px 20px; display: grid; gap: 18px;
+               grid-template-columns: minmax(0, 1fr);
                text-align: left; }   /* inactive rows still host one in a <td> */
+.detail-wrap > .block, .detail-positions > .block { overflow-x: auto; }
 .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
 .detail-positions:empty { display: none; }   /* no gap when a coin holds nothing */
 

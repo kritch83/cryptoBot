@@ -699,3 +699,24 @@ Sep 18 - dashboard performance charts
   - Coin performance quadrant: x = realized, y = unrealized, dot size =
     position value, red = underwater. Click a dot to open the coin.
   - Row/donut/dot selection share one openCoin(); total cards share renderCards().
+
+Oct 6 - fees card + 90-day period card
+  - helpers/trade_history.py now parses booked BUY / LIMIT-BUY FILL lines as
+    well as sells (each record carries kind="buy"/"sell"), reusing the same
+    incremental read + per-file cache. all_trades() filters to sells, so
+    /api/history is unchanged. New fee_totals() -> total / buy / sell / counts /
+    last_30d / since.
+  - New GET /api/fees (optional ?symbol=), and a "Fees paid" card in the totals
+    row: $198.28 so far (600 buys $97.59 + 195 sells $100.69), with the last-30d
+    figure in the sub-line. Fees are already inside cost basis and out of
+    proceeds, so realized PnL is net of them -- the card says so in its tooltip.
+  - The period row's "Best day - 30d" card is now "Last 90 days", matching the
+    today / 7 / 30 day cards beside it.
+
+Oct 15 - mobile fix: coin detail panel
+  - On phones the "Next buy / sell" block sat off-screen to the right of
+    "Position" and the page scrolled sideways. Cause: .detail-wrap's implicit
+    `auto` grid column sized itself to the widest child's min-content (the
+    open-levels table / config form, ~610px), so the block grid inside saw
+    642px and fit two columns. Fixed with grid-template-columns: minmax(0, 1fr)
+    on .detail-wrap; the open-levels table now scrolls inside its own block.

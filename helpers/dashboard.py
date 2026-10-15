@@ -1031,6 +1031,13 @@ def _make_app(ctx: DashboardContext):
         points = await asyncio.to_thread(equity.load, days)
         return web.json_response({"points": points, "every_sec": equity.EQUITY_EVERY_SEC})
 
+    @routes.get("/api/fees")
+    async def fees(request):
+        symbol = request.query.get("symbol") or None
+        if symbol:
+            symbol = symbol.replace("_", "/")
+        return web.json_response(await asyncio.to_thread(trade_history.fee_totals, symbol))
+
     @routes.get("/api/history")
     async def history(request):
         symbol = request.query.get("symbol") or None
