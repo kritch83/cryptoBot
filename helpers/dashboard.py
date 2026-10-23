@@ -150,6 +150,15 @@ def _next_buy(state: State, cfg: dict, price: Optional[float]) -> dict:
     if state.buys_paused:
         return {"kind": "buys_paused", "label": "Buying paused"}
     pbo = state.pending_buy_order
+    trigger = state.entry_trigger_price
+    if (trigger is not None and not state.positions and pbo is None
+            and not state.trailing_buy.armed):
+        return {
+            "kind": "trigger", "price": trigger, "delta_pct": _delta_pct(trigger, price),
+            "label": "Waiting for entry trigger",
+            "source": ("persistent -- re-arms after every sell" if state.entry_trigger_persist
+                       else "one-shot -- cleared by the first buy"),
+        }
     if pbo is not None:
         buffer_pct = max(cfg["trail_buy_pct"], cfg.get("limit_buy_offset_pct", 0.001))
         cancels_at = pbo.placed_at_price * (1 + buffer_pct)
@@ -269,6 +278,10 @@ def _coin_snapshot(ctx: DashboardContext, cfg: dict, index: int) -> dict:
         "breakeven_exit_armed": state.breakeven_exit_armed,
         "pause_after_sell": state.pause_after_sell,
         "buys_paused": state.buys_paused,
+        "entry_trigger": (None if state.entry_trigger_price is None else
+                          {"price": state.entry_trigger_price,
+                           "persist": state.entry_trigger_persist,
+                           "delta_pct": _delta_pct(state.entry_trigger_price, price)}),
         "stop_loss_pct": state.stop_loss_pct,
         "stop_loss_trigger": stop_trigger,
         "stop_loss_delta_pct": _delta_pct(stop_trigger, price),
@@ -465,7 +478,7 @@ def build_meta() -> dict:
 # --- command + config plumbing ----------------------------------------------
 
 def queue_action(ctx: DashboardContext, symbol: str, kind: str,
-                 value: Optional[float] = None) -> dict:
+                 value: Optional[float] = None, persist: bool = False) -> dict:
     """Validate and enqueue one manual action. Returns a result dict.
 
     Deliberately thin: the checks here are the advisory ones from actions.py so
@@ -489,10 +502,12 @@ def queue_action(ctx: DashboardContext, symbol: str, kind: str,
         payload = None
 
     ctx.cmd_queues[symbol].put_nowait(
-        PendingAction(kind, 0, REASONS[kind], value=payload)
+        PendingAction(kind, 0, REASONS[kind], value=payload,
+                      persist=persist and kind == "set_entry_trigger")
     )
-    logging.info("DASHBOARD: queued %s -> %s%s", symbol, kind,
-                 f" value={payload}" if payload is not None else "")
+    logging.info("DASHBOARD: queued %s -> %s%s%s", symbol, kind,
+                 f" value={payload}" if payload is not None else "",
+                 " persist" if persist and kind == "set_entry_trigger" else "")
     return {"ok": True, "symbol": symbol, "kind": kind, "value": payload,
             "message": f"queued {kind} for {symbol}"}
 
@@ -985,7 +1000,7 @@ def _make_app(ctx: DashboardContext):
             except (TypeError, ValueError):
                 return web.json_response({"ok": False, "error": f"invalid number {raw!r}"},
                                          status=400)
-        result = queue_action(ctx, symbol, kind, value)
+        result = queue_action(ctx, symbol, kind, value, body.get("persist") is True)
         return web.json_response(result, status=200 if result["ok"] else 400)
 
     @routes.post("/api/coin/{key}/config")

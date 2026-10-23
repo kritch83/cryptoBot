@@ -39,6 +39,7 @@ from helpers.actions import (
     REASONS,
     VALUE_KINDS,
     VALUE_LABELS,
+    check_entry_trigger,
     check_stop_loss,
     check_target_sell,
 )
@@ -323,6 +324,8 @@ def _status_tags(st: State, cfg: dict) -> list:
         tags.append("[PAUSED]")
     if st.buys_paused:
         tags.append("[BUYS-PAUSED]")
+    if st.entry_trigger_price is not None:
+        tags.append(f"[TRIGGER <=${st.entry_trigger_price:,.{pp}f}{' P' if st.entry_trigger_persist else ''}]")
     if st.pending_buy_order is not None:
         tags.append(f"[BUY LIMIT @${st.pending_buy_order.limit_price:,.{pp}f}]")
     elif st.trailing_buy.armed:
@@ -438,6 +441,12 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
         out.append(f"{'  Pending LIMIT BUY:':<{L}}@ ${pbo.limit_price:,.{pp}f}  qty={pbo.qty_coin:.8f} {cfg['symbol'].split('/')[0]}  level={pbo.level}")
         out.append(f"{'  Fills when:':<{L}}ask <= ${pbo.limit_price:,.{pp}f}{delta_str(pbo.limit_price)}")
         out.append(f"{'  Cancels when:':<{L}}price > ${cancel:,.{pp}f}{delta_str(cancel)}")
+    elif (state.entry_trigger_price is not None and not state.positions
+          and not state.trailing_buy.armed):
+        trg = state.entry_trigger_price
+        out.append(f"{'  Status:':<{L}}waiting for ENTRY TRIGGER -- no new grid until price drops to it")
+        out.append(f"{'  Trigger:':<{L}}${trg:,.{pp}f}{delta_str(trg)}  "
+                   f"({'persistent' if state.entry_trigger_persist else 'one-shot'}; menu e -> 0 clears)")
     elif state.trailing_buy.armed and state.trailing_buy.extreme is not None:
         fire = state.trailing_buy.extreme * (1 + trail_buy_pct)
         if state.trailing_buy.manual:
@@ -459,6 +468,10 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
         out.append(f"{'  Source:':<{L}}-{drop_pct:.1%} from observed high ${state.initial_entry_high:,.{pp}f}")
     else:
         out.append(f"{'  Status:':<{L}}waiting for first price tick...")
+    if state.entry_trigger_price is not None and state.positions:
+        out.append(f"{'  Entry trigger:':<{L}}${state.entry_trigger_price:,.{pp}f} "
+                   f"({'persistent' if state.entry_trigger_persist else 'one-shot'}) -- "
+                   f"after this grid sells, waits for that price")
 
     out.append("")
     out.append("Next SELL:")
@@ -792,11 +805,16 @@ async def run(simulate_file: Optional[str], dry_run: bool,
         "  5 breakeven  6 pause-after-sell   7 BUY now               8 arm buy-trail\n"
         "  9 sell ALL now (market)           p sell ALL at MY price (target)\n"
         "  a toggle sell-trail (arm/disarm)   b toggle pause buying (sells carry on)\n"
+        "  e entry trigger $ (new grid waits for a drop to it)\n"
         "  t clear targets   r RETIRE coin   c clear stats (full reset)\n"
         "  8 buy-trail: trailing dip-buy -- arms at current price, trails the low, fires ONE\n"
         "    buy on a +trail_buy_pct rebound (works flat or holding; disarm via t)\n"
         "  3 stop-loss: % below avg entry (tracks avg as the grid grows); on hit market-sells\n"
         "    ALL + pauses + disarms (one-shot; survives restarts; 0/empty clears)\n"
+        "  e entry trigger: type a price below market; while flat no new grid starts until\n"
+        "    price drops to it, then a buy-trail times the first buy. Set while holding, it\n"
+        "    waits after the grid sells. Confirm Y = one-shot, P = persistent (every cycle).\n"
+        "    Turns off pause / pause buying / a manual buy-trail; turning those on clears it\n"
         "  p target sell: type an absolute price; places a real post-only limit sell for the\n"
         "    WHOLE position that never auto-cancels; grid buys freeze while it rests; coin\n"
         "    pauses when it fills (survives restarts; 0/empty clears; must be above market)\n"
@@ -813,13 +831,45 @@ async def run(simulate_file: Optional[str], dry_run: bool,
         lines.append("  all actions ask 'Y' to confirm except 1) live stats and 2) config")
         return "\n".join(lines)
 
-    def _enqueue(idx: int, kind: str, value: Optional[float] = None) -> None:
+    def _enqueue(idx: int, kind: str, value: Optional[float] = None,
+                 persist: bool = False) -> None:
         sym = enabled[idx]["symbol"]
         reason = REASONS.get(kind)
         if reason is None:
             return
-        cmd_queues[sym].put_nowait(PendingAction(kind, 0, reason, value=value))
-        print(f"  queued: {sym} -> {kind}")
+        cmd_queues[sym].put_nowait(PendingAction(kind, 0, reason, value=value, persist=persist))
+        print(f"  queued: {sym} -> {kind}{' (persistent)' if persist else ''}")
+
+    def _commit_entry_trigger(idx: int, sym: str, price: float) -> None:
+        """ENTER pressed in entry-trigger value entry: validate, arm the Y/P confirm."""
+        st = states[sym]
+        pp = enabled[idx]["price_prec"]
+        lp = last_price[sym]
+        problem = check_entry_trigger(price, st, lp)
+        if problem is not None:
+            print(f"  {sym}: {problem}")
+            return
+        if price == 0:
+            pending_val[0] = 0.0
+            confirm_cmd[0] = (idx, "set_entry_trigger", "clear entry trigger")
+            print(f"  {sym}: CLEAR entry trigger (currently ${st.entry_trigger_price:,.{pp}f}) -- "
+                  f"new grids start normally again.  Type Y to confirm, any other key cancels")
+            return
+        off = [name for flag, name in ((st.buys_paused, "pause buying"),
+                                       (st.paused, "pause trading -- selling resumes too"),
+                                       (st.trailing_buy.armed and st.trailing_buy.manual,
+                                        "the manual buy-trail"))
+               if flag]
+        when = ("waits from now" if not st.positions
+                else "applies after the current grid sells (the grid itself is untouched)")
+        print(f"  {sym}: SET entry trigger ${price:,.{pp}f} ({(price / lp - 1) * 100:+.2f}% from now "
+              f"${lp:,.{pp}f}) -- no new grid until price drops to it, then a buy-trail times "
+              f"the first buy; {when}."
+              + (f"\n  Also turns OFF: {', '.join(off)}." if off else "")
+              + "\n  Type Y = one-shot (cleared by the first buy), P = persistent (every cycle), "
+                "any other key cancels")
+        pending_val[0] = price
+        confirm_cmd[0] = (idx, "set_entry_trigger", f"set entry trigger ${price:,.{pp}f}")
 
     def _commit_stop_loss(idx: int, sym: str, pct: float) -> None:
         """ENTER pressed in stop-loss value entry: validate, arm the Y-confirm."""
@@ -943,10 +993,11 @@ async def run(simulate_file: Optional[str], dry_run: bool,
                 else:
                     print(f"  cancelled: {label}")
                 return
-            if ch in ("y", "Y"):
+            persist = kind == "set_entry_trigger" and ch in ("p", "P") and bool(pending_val[0])
+            if ch in ("y", "Y") or persist:
                 if kind in VALUE_KINDS:
                     val, pending_val[0] = pending_val[0], None
-                    _enqueue(idx, kind, value=val)
+                    _enqueue(idx, kind, value=val, persist=persist)
                 else:
                     _enqueue(idx, kind)
             else:
@@ -979,6 +1030,8 @@ async def run(simulate_file: Optional[str], dry_run: bool,
                     return
                 if kind == "set_stop_loss":
                     _commit_stop_loss(idx, sym, num)
+                elif kind == "set_entry_trigger":
+                    _commit_entry_trigger(idx, sym, num)
                 else:
                     _commit_target_sell(idx, sym, num)
                 return
@@ -1009,6 +1062,15 @@ async def run(simulate_file: Optional[str], dry_run: bool,
                     cur = f"-{st.stop_loss_pct:.2%}" if st.stop_loss_pct else "none"
                     print(f"  {sym}: stop-loss as % below avg entry (current: {cur})."
                           f"  Type a number then ENTER; 0/empty clears; ESC cancels")
+                elif kind == "set_entry_trigger":
+                    pp = enabled[idx]["price_prec"]
+                    cur = (f"${st.entry_trigger_price:,.{pp}f}"
+                           f"{' persistent' if st.entry_trigger_persist else ' one-shot'}"
+                           if st.entry_trigger_price is not None else "none")
+                    lp = last_price[sym]
+                    now = f"; now ${lp:,.{pp}f}" if lp is not None else ""
+                    print(f"  {sym}: entry trigger in $ -- a new grid waits for price to drop to it "
+                          f"(current: {cur}{now}).  Type a price then ENTER; 0/empty clears; ESC cancels")
                 else:
                     pp = enabled[idx]["price_prec"]
                     pso = st.pending_sell_order

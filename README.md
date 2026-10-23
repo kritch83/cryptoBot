@@ -14,6 +14,7 @@ trailing entry/exit state machines.
 - Exits: a stop-loss that sells everything and pauses the coin, a breakeven exit that covers fees, a limit sell at your own price, and a manual sell-trail that never sells at a loss.
 
 - Manual controls: pause trading, pause buying only, pause after the next sell, a one-off buy-trail, force buy or sell now, and clear targets or stats.
+- Entry trigger: a price the coin must drop to before a new grid starts. A grid already running is untouched; after it sells, the bot waits for the trigger, then a buy-trail times the first buy. One-shot by default, or **Persist** to wait for it after every sell.
 
 - Retire a coin: records its lifetime profit in a ledger so it still counts in your totals, then resets it.
 
@@ -177,7 +178,7 @@ coin's next price tick. Every action asks for confirmation first.
 | | | `t` | clear targets |
 | `5` | toggle breakeven-exit | `r` | **retire coin** (book PnL, full reset) |
 | `6` | toggle pause-after-sell | `c` | **clear stats** (full reset) |
-| `7` | force BUY now (market) | | |
+| `7` | force BUY now (market) | `e` | set/clear entry trigger $ (`Y` one-shot, `P` persistent) |
 | `8` | arm buy-trail (trailing dip-buy) | | |
 
 <br></b>

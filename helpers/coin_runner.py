@@ -91,6 +91,44 @@ def handle_initial_entry_trail(state: State, price: float, cfg: dict, log: loggi
     return None
 
 
+def handle_entry_trigger(state: State, price: float, cfg: dict,
+                         log: logging.LoggerAdapter) -> tuple[bool, bool]:
+    """Gate a fresh cycle on the user's entry trigger. Returns (blocked, hit).
+
+    Only acts while flat with no buy trail armed: above the trigger the entry is
+    blocked (waiting); at/below it a buy trail arms right here and the existing
+    entry-trail code times the buy off the rebound -- no further drop_pct.
+    armed_at_price=None means that trail can't disarm itself on a bounce.
+
+    Deliberately stateless: if the trail's limit buy later cancels unfilled and
+    price is back above the trigger, the coin just waits again rather than
+    starting a grid above the user's price.
+    """
+    trigger = state.entry_trigger_price
+    if trigger is None or state.positions or state.trailing_buy.armed:
+        return False, False
+    if price > trigger:
+        return True, False
+    pp = cfg["price_prec"]
+    state.trailing_buy = TrailState(armed=True, extreme=price, armed_at_price=None)
+    log.info(
+        f"[{state.mode.upper()}] ENTRY TRIGGER HIT price=${price:.{pp}f} "
+        f"(trigger ${trigger:.{pp}f}{', persistent' if state.entry_trigger_persist else ', one-shot'}) "
+        f"-- buy-trail armed; buys on a +{cfg['trail_buy_pct']:.1%} bounce off the low"
+    )
+    return True, True
+
+
+def _drop_entry_trigger(state: State, pp: int, log: logging.LoggerAdapter, why: str) -> None:
+    """Disarm the entry trigger (if set) and say why -- a toggle that
+    contradicts it was just turned on, or it was used up."""
+    if state.entry_trigger_price is None:
+        return
+    log.info(f"MANUAL: entry trigger ${state.entry_trigger_price:.{pp}f} CLEARED -- {why}")
+    state.entry_trigger_price = None
+    state.entry_trigger_persist = False
+
+
 def handle_buy_trail(state: State, price: float, cfg: dict, log: logging.LoggerAdapter) -> Optional[PendingAction]:
     drop_pct        = cfg["drop_pct"]
     trail_buy_pct   = cfg["trail_buy_pct"]
@@ -658,6 +696,7 @@ def _finalize_buy(state: State, fill: dict, level: int, cfg: dict, reason: str,
         state.trailing_buy = TrailState()
         return
 
+    opens_cycle = not state.positions
     cost_usd = fill["qty"] * fill["price"] + fill["fee_usd"]
     state.positions.append(Position(
         level=level, qty_coin=fill["qty"], entry_price=fill["price"],
@@ -676,6 +715,13 @@ def _finalize_buy(state: State, fill: dict, level: int, cfg: dict, reason: str,
         f"fee=${fill['fee_usd']:.{pp}f} cost=${cost_usd:.{pp}f} "
         f"avg_entry=${state.avg_entry_price:.{pp}f} ({reason})"
     )
+    # A one-shot entry trigger is spent by the buy that starts the grid. Grid
+    # adds on a cycle already running never touch it -- a trigger set while
+    # holding is meant for AFTER that grid sells.
+    if opens_cycle and state.entry_trigger_price is not None and not state.entry_trigger_persist:
+        log.info(f"[{state.mode.upper()}] ENTRY TRIGGER ${state.entry_trigger_price:.{pp}f} "
+                 f"used (one-shot) -- cleared")
+        state.entry_trigger_price = None
 
 
 async def cancel_pending_buy_and_book(exchange, state: State, cfg: dict,
@@ -1074,9 +1120,16 @@ async def _finalize_sell(state: State, fill: dict, cfg: dict, reason: str, tag: 
             f"no new buy cycle until resumed (select coin -> menu 4 -> Y)"
         )
 
+    trigger_note = ""
+    if state.entry_trigger_price is not None:
+        trigger_note = f" -- waiting for ${state.entry_trigger_price:.{pp}f} before the next grid"
+        log.info(f"[{state.mode.upper()}] ENTRY TRIGGER ${state.entry_trigger_price:.{pp}f} "
+                 f"armed -- no new grid until price drops to it"
+                 f"{' (persistent)' if state.entry_trigger_persist else ''}")
+
     mode_tag = "[PAPER] " if state.mode == "paper" else ""
     pause_note = " -- now PAUSED" if paused_now else ""
-    await push_notify(f"{mode_tag}{base} sold for {pct:+.5f}% (${realized:.{pp}f}){pause_note}")
+    await push_notify(f"{mode_tag}{base} sold for {pct:+.5f}% (${realized:.{pp}f}){pause_note}{trigger_note}")
     return realized
 
 
@@ -1215,6 +1268,8 @@ async def execute_clear_stats(exchange, state: State, cfg: dict,
     state.breakeven_exit_armed = False
     state.pause_after_sell = False
     state.stop_loss_pct = None
+    state.entry_trigger_price = None
+    state.entry_trigger_persist = False
     state.trailing_buy = TrailState()
     state.trailing_sell = TrailState()
     state.pending_buy_order = None
@@ -1604,6 +1659,8 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
     if cmd.kind == "pause_toggle":
         state.paused = not state.paused
         log.info("MANUAL: %s", "PAUSED" if state.paused else "RESUMED")
+        if state.paused:
+            _drop_entry_trigger(state, pp, log, "coin paused by hand")
         return None
 
     if cmd.kind == "pause_buys_toggle":
@@ -1612,6 +1669,7 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
         # close. Manual force-buy still works as a deliberate one-off.
         state.buys_paused = not state.buys_paused
         if state.buys_paused:
+            _drop_entry_trigger(state, pp, log, "buying paused")
             state.trailing_buy = TrailState()   # a half-formed buy trail must not fire on resume
             if state.pending_buy_order is not None:
                 log.info("MANUAL: BUYING PAUSED -- cancelling the resting limit buy; sells carry on")
@@ -1624,6 +1682,54 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
                 state.initial_entry_high = None
             log.info("MANUAL: BUYING RESUMED")
         return None
+
+    if cmd.kind == "set_entry_trigger":
+        # 0 disarms; otherwise arm. Setting one turns OFF whatever would keep it
+        # from ever starting a grid (pause buying, pause trading, a manual
+        # buy-trail). Pause-after-sell is left alone on purpose.
+        target = cmd.value or 0.0
+        if target <= 0:
+            if state.entry_trigger_price is None:
+                log.info("MANUAL: clear entry trigger ignored -- none set")
+            else:
+                _drop_entry_trigger(state, pp, log, "disarmed")
+            return None
+        if target >= current_price:
+            log.info(f"MANUAL: entry trigger ${target:.{pp}f} refused -- at/above current "
+                     f"${current_price:.{pp}f} (it must be below; the bot waits for a drop)")
+            return None
+        old = state.entry_trigger_price
+        state.entry_trigger_price = target
+        state.entry_trigger_persist = bool(cmd.persist)
+        turned_off = []
+        if state.buys_paused:
+            state.buys_paused = False
+            turned_off.append("pause buying")
+        if state.paused:
+            state.paused = False
+            turned_off.append("pause trading (selling resumes too)")
+        if state.trailing_buy.armed and state.trailing_buy.manual:
+            state.trailing_buy = TrailState()
+            turned_off.append("manual buy-trail")
+        cancel_entry_buy = False
+        if not state.positions:
+            # Flat: waiting starts now. An auto entry trail half-way to a buy
+            # above the trigger must not fire, and neither may a resting entry
+            # buy priced above it (the dispatch cancels that one).
+            if state.trailing_buy.armed:
+                state.trailing_buy = TrailState()
+            pbo = state.pending_buy_order
+            cancel_entry_buy = pbo is not None and pbo.limit_price > target
+        when = ("no new grid until price drops to it" if not state.positions
+                else "applies after the current grid sells")
+        log.info(
+            f"MANUAL: entry trigger ARMED ${target:.{pp}f} "
+            f"({'persistent' if state.entry_trigger_persist else 'one-shot'}"
+            f"{f', was ${old:.{pp}f}' if old is not None else ''}; now ${current_price:.{pp}f}) -- {when}"
+            + (f"; turned off: {', '.join(turned_off)}" if turned_off else "")
+            + ("; cancelling the resting entry buy" if cancel_entry_buy else "")
+        )
+        return cmd if cancel_entry_buy else None
 
     if cmd.kind == "arm_sell_trail":
         # A toggle: pressing it while a MANUAL sell-trail is armed disarms it.
@@ -1661,6 +1767,7 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
             # while paused) and then fire the moment buying resumed.
             log.info("MANUAL: arm-buy-trail ignored -- buying is paused (menu b resumes)")
             return None
+        _drop_entry_trigger(state, pp, log, "manual buy-trail armed")
         state.trailing_buy = TrailState(armed=True, extreme=current_price, armed_at_price=current_price, manual=True)
         where = "grid add" if state.positions else "initial entry"
         log.info(
@@ -1890,10 +1997,21 @@ async def run_coin(
                             # Skip entry trails while a limit buy is resting, or
                             # while buying is paused.
                             if state.pending_buy_order is None and not state.buys_paused:
-                                if manual_buy_trail:
-                                    action = handle_manual_buy_trail(state, price, cfg, log)
-                                else:
-                                    action = handle_initial_entry_trail(state, price, cfg, log)
+                                waiting, hit = handle_entry_trigger(state, price, cfg, log)
+                                if hit:
+                                    tag = "[PAPER] " if state.mode == "paper" else ""
+                                    await push_notify(
+                                        f"{tag}{symbol.split('/')[0]} hit entry trigger "
+                                        f"${state.entry_trigger_price:.{pp}f} (now ${price:.{pp}f}) "
+                                        f"-- buy-trail armed, new grid starts on the bounce"
+                                    )
+                                # Waiting above the trigger, or it just armed the
+                                # trail: the entry trail takes over from next tick.
+                                if not waiting:
+                                    if manual_buy_trail:
+                                        action = handle_manual_buy_trail(state, price, cfg, log)
+                                    else:
+                                        action = handle_initial_entry_trail(state, price, cfg, log)
                         else:
                             # A manual target sell resting = user is exiting at
                             # their price -- freeze new grid buys until it fills
@@ -1963,6 +2081,13 @@ async def run_coin(
                         # Buying was paused with a limit buy resting: cancel it,
                         # booking any portion that filled before the cancel landed.
                         await cancel_pending_buy_and_book(exchange, state, cfg, log, "pause buying")
+                    elif action.kind == "set_entry_trigger":
+                        # A new trigger sits below a resting entry buy: cancel it.
+                        # If part of it raced a fill, that booking opens a cycle --
+                        # keep the trigger anyway; the user meant it for the next one.
+                        armed = (state.entry_trigger_price, state.entry_trigger_persist)
+                        await cancel_pending_buy_and_book(exchange, state, cfg, log, "entry trigger")
+                        state.entry_trigger_price, state.entry_trigger_persist = armed
 
                 save_state(symbol, state)
             except ccxt.NetworkError as e:

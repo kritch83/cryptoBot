@@ -731,3 +731,28 @@ Oct 15 - helpers/config.py is now git-ignored
     of an import traceback.
   - README setup steps updated; also fixed the env template name there
     (.env.example, not env.example).
+
+Oct 23 - entry trigger price (Controls -> Buy, CLI key e)
+  - New per-coin runtime control: a price the coin must drop to before a NEW
+    grid starts. A grid already running is untouched; after it sells, the bot
+    waits until price <= trigger, then arms a buy-trail and buys on the normal
+    trail_buy_pct bounce. One-shot (cleared by the buy that opens the grid) or
+    Persist (re-waits after every sell). Must be below the current price.
+  - State: entry_trigger_price / entry_trigger_persist (old state files load
+    with defaults); PendingAction.persist carries the checkbox.
+  - Setting it turns off Pause buying, Pause trading and a manual buy-trail;
+    turning any of those on by hand clears it. Automatic pauses (pause-after-
+    sell, stop-loss) keep it. Flat with a resting entry buy above the trigger:
+    that buy is cancelled. Force BUY still works as an override.
+  - Pushover: "hit entry trigger $X" when it arms, and "-- waiting for $X
+    before the next grid" appended to the sell notice.
+  - Dashboard: Entry trigger $ row with Persist checkbox; the button is a toggle
+    (Set / lit Disarm). Badge WAITING <=$X (amber, holding the coin back) or
+    TRIGGER <=$X (queued behind a running grid), "· REPEAT" when persistent.
+    Next buy card shows the trigger. Confirm dialogs say what it turns off and
+    which other controls clear it.
+  - CLI: menu key e, confirm Y = one-shot / P = persistent; [TRIGGER <=$X] tag
+    and a Next BUY line in the stats screen.
+  - Tested: 27 scripted logic checks, a paper-mode --simulate run of the full
+    wait -> hit -> buy -> sell -> wait -> buy cycle, and the dashboard flows in
+    a sandboxed copy (no .env, own data dir).

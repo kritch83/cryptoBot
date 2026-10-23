@@ -88,6 +88,10 @@ class State:
     pause_after_sell: bool = False
     buys_paused: bool = False            # no new buys (auto or trail-fired); selling carries on
     stop_loss_pct: Optional[float] = None   # hard stop: fraction below avg entry (0.10 = -10%); None = off
+    # Entry trigger: while flat, no new grid starts until price drops to this.
+    # One-shot (cleared by the first fill) unless persist, which re-arms every cycle.
+    entry_trigger_price: Optional[float] = None
+    entry_trigger_persist: bool = False
     trailing_buy: TrailState = field(default_factory=TrailState)
     trailing_sell: TrailState = field(default_factory=TrailState)
     pending_sell_order: Optional[PendingSellOrder] = None
@@ -135,6 +139,7 @@ class PendingAction:
     force_market: bool = False   # if True for kind="sell_all", bypass cfg['order_type']
     value: Optional[float] = None      # set_stop_loss payload: fraction below avg; 0.0/None = clear
     from_stop_loss: bool = False       # marks a sell_all emitted by handle_stop_loss (tick loop disarms after success)
+    persist: bool = False              # set_entry_trigger: keep the trigger armed for every cycle
 
 
 def state_path(symbol: str) -> Path:

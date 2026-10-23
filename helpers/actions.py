@@ -41,6 +41,8 @@ ACTIONS: tuple[Action, ...] = (
     Action("7", "force BUY now (market)",     "buy",                  True, danger=True),
     Action("8", "arm buy-trail (trailing dip-buy; fires ONE buy on the rebound)",
            "arm_buy_trail", True),
+    Action("e", "set/clear entry trigger $ (new grid waits for price to drop to it)",
+           "set_entry_trigger", True, takes_value=True),
     Action("9", "sell ALL now (market)",      "sell_all",             True, danger=True),
     Action("p", "sell ALL at MY price (post-only limit; pauses after fill)",
            "set_target_sell", True, danger=True, takes_value=True),
@@ -59,8 +61,9 @@ LOCAL_KINDS = frozenset({"stats", "config"})
 VALUE_KINDS = frozenset(a.kind for a in ACTIONS if a.takes_value)
 
 # Per-kind labels: (echo-line unit, short name for cancel/invalid messages)
-VALUE_LABELS = {"set_stop_loss":   ("stop-loss %",   "stop-loss"),
-                "set_target_sell": ("target sell $", "target")}
+VALUE_LABELS = {"set_stop_loss":     ("stop-loss %",     "stop-loss"),
+                "set_target_sell":   ("target sell $",   "target"),
+                "set_entry_trigger": ("entry trigger $", "entry trigger")}
 
 REASONS = {
     "pause_toggle":         "manual pause toggle",
@@ -76,6 +79,7 @@ REASONS = {
     "retire":               "manual retire-coin",
     "set_stop_loss":        "manual set-stop-loss",
     "set_target_sell":      "manual target-sell",
+    "set_entry_trigger":    "manual entry-trigger",
 }
 
 # Queueable kinds -- anything a UI may legitimately send to a coin task.
@@ -124,6 +128,27 @@ def check_target_sell(price: float, state: State, last_price: Optional[float]) -
     return None
 
 
+def check_entry_trigger(price: float, state: State, last_price: Optional[float]) -> Optional[str]:
+    """Validate an entry-trigger price in quote currency (absolute $).
+
+    Drop only: the trigger must sit BELOW the current price, so a typo can't
+    turn into an instant buy. 0 clears, which needs a trigger to be set.
+    Mirrors coin_runner.apply_manual.
+    """
+    if price < 0:
+        return f"{price:g} out of range (need a price below current; 0 clears)"
+    if price == 0:
+        if state.entry_trigger_price is None:
+            return "no entry trigger set -- nothing to clear"
+        return None
+    if last_price is None:
+        return "no price tick yet -- can't validate the trigger; try again in a moment"
+    if price >= last_price:
+        return (f"trigger {price:g} is at/above current {last_price:g} -- it must be below "
+                f"the current price (the bot waits for a drop to it)")
+    return None
+
+
 def check_value(kind: str, value: float, state: State,
                 last_price: Optional[float]) -> Optional[str]:
     """Dispatch to the right validator for a value-taking kind."""
@@ -131,13 +156,15 @@ def check_value(kind: str, value: float, state: State,
         return check_stop_loss(value, state)
     if kind == "set_target_sell":
         return check_target_sell(value, state, last_price)
+    if kind == "set_entry_trigger":
+        return check_entry_trigger(value, state, last_price)
     return None
 
 
 def normalize_value(kind: str, value: float) -> float:
     """Convert a UI-entered number into the unit PendingAction.value carries.
 
-    Stop-loss is typed as a percent but stored as a fraction; target-sell is an
-    absolute price on both sides.
+    Stop-loss is typed as a percent but stored as a fraction; target-sell and
+    entry-trigger are absolute prices on both sides.
     """
     return value / 100.0 if kind == "set_stop_loss" else value

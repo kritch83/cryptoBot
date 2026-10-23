@@ -235,6 +235,14 @@ function modal(opts) {
 
 /* --- action descriptions (mirror the CLI's Y-confirm wording) ------------- */
 
+/* The entry trigger is one-at-a-time with Pause trading / Pause buying / a
+   manual buy-trail: turning one of those on by hand clears it. Say so. */
+function clearsTriggerNote(coin) {
+  return coin.entry_trigger
+    ? `<p class="small warn-text">This also clears the entry trigger ` +
+      `(${esc(price(coin.entry_trigger.price, coin.price_prec))}).</p>` : '';
+}
+
 function actionCopy(kind, coin) {
   const base = coin.base;
   const held = coin.levels
@@ -248,6 +256,12 @@ function actionCopy(kind, coin) {
               `at level ${coin.levels}, ignoring the grid trigger.`,
         html: (coin.buys_paused ? `<p><b>Buying is paused</b> — this is a one-off manual ` +
                `buy; it does not resume automatic buying.</p>` : '') +
+              (coin.entry_trigger && !coin.levels
+                ? `<p>This skips the entry trigger ` +
+                  `(${price(coin.entry_trigger.price, coin.price_prec)}) and starts the grid now` +
+                  (coin.entry_trigger.persist ? '; the trigger stays armed for the next cycle.'
+                                              : ', which uses up the one-shot trigger.') + `</p>`
+                : '') +
               `<p class="small muted">A pending limit buy, if any, is cancelled first. ` +
               `Currently ${held}.</p>`,
       };
@@ -286,7 +300,7 @@ function actionCopy(kind, coin) {
             html: `<p>Trading resumes on the next tick.</p>` }
         : { title: `Pause ${coin.symbol}`, confirmLabel: 'Pause',
             html: `<p>No new buys or sells. Resting limit orders are still serviced ` +
-                  `and stop-loss is skipped while paused.</p>` };
+                  `and stop-loss is skipped while paused.</p>` + clearsTriggerNote(coin) };
     case 'pause_buys_toggle':
       return coin.buys_paused
         ? { title: `Resume buying on ${coin.symbol}`, confirmLabel: 'Resume buying',
@@ -298,7 +312,8 @@ function actionCopy(kind, coin) {
                   `target sell carry on, so the coin can still exit its position.</p>` +
                   (coin.next_buy.kind === 'limit'
                     ? `<p class="small muted">The resting limit buy is cancelled.</p>` : '') +
-                  `<p class="small muted">"Force BUY now" still works as a one-off.</p>` };
+                  `<p class="small muted">"Force BUY now" still works as a one-off.</p>` +
+                  clearsTriggerNote(coin) };
     case 'arm_sell_trail':
       if (coin.trailing_sell?.armed && coin.trailing_sell.manual) {
         return { title: `Disarm sell-trail on ${coin.symbol}`, confirmLabel: 'Disarm',
@@ -312,7 +327,8 @@ function actionCopy(kind, coin) {
     case 'arm_buy_trail':
       return { title: `Arm buy-trail on ${coin.symbol}`, confirmLabel: 'Arm',
         html: `<p>Trailing dip-buy: arms now, follows the low down, fires <b>one</b> buy on a ` +
-              `${pct(coin.config.trail_buy_pct * 100, 3)} rebound. Clear it with “clear targets”.</p>` };
+              `${pct(coin.config.trail_buy_pct * 100, 3)} rebound. Clear it with “clear targets”.</p>` +
+              clearsTriggerNote(coin) };
     case 'arm_breakeven_exit':
       return { title: `${coin.breakeven_exit_armed ? 'Disarm' : 'Arm'} breakeven-exit on ${coin.symbol}`,
         confirmLabel: coin.breakeven_exit_armed ? 'Disarm' : 'Arm',
@@ -330,6 +346,38 @@ function actionCopy(kind, coin) {
     default:
       return { title: kind, confirmLabel: 'Confirm', html: '' };
   }
+}
+
+function triggerCopy(coin, value, persist) {
+  const p = coin.price_prec;
+  if (!value) {
+    return { title: `Disarm entry trigger on ${coin.symbol}`, confirmLabel: 'Disarm',
+      html: `<p>Removes the ${price(coin.entry_trigger.price, p)} trigger. ` +
+            (coin.levels ? 'After this grid sells, the next one starts normally.'
+                         : 'The coin goes back to its normal entry logic from the current price.') +
+            `</p>` };
+  }
+  const off = [];
+  if (coin.buys_paused) off.push('Pause buying');
+  if (coin.paused) off.push('Pause trading — <b>selling resumes too</b>');
+  if (coin.trailing_buy?.armed && coin.trailing_buy.manual) off.push('the manual buy-trail');
+  const away = coin.price ? (value / coin.price - 1) * 100 : null;
+  return {
+    title: `Entry trigger ${price(value, p)} on ${coin.symbol}`, confirmLabel: 'Arm trigger',
+    html: `<p>No new grid starts until price drops to <b>${price(value, p)}</b>` +
+          (away === null ? '' : ` (${pct(away)} from now)`) + `. When it gets there a buy-trail ` +
+          `arms and the first buy fires on a ${pct(coin.config.trail_buy_pct * 100, 3)} bounce ` +
+          `off the low.</p>` +
+          `<p>` + (coin.levels
+            ? `The current grid (${coin.levels} level(s)) is untouched — the trigger applies after it sells.`
+            : 'The coin is flat, so it starts waiting now' +
+              (coin.next_buy.kind === 'limit' && coin.next_buy.price > value
+                ? ', and the resting entry buy above the trigger is cancelled.' : '.')) + `</p>` +
+          `<p>${persist
+            ? '<b>Persistent:</b> after every sell the bot waits for this price again.'
+            : '<b>One-shot:</b> cleared by the buy that starts the grid; later cycles run normally.'}</p>` +
+          (off.length ? `<p class="small warn-text">Turns off: ${off.join(', ')}.</p>` : ''),
+  };
 }
 
 function valueCopy(kind, coin, value) {
@@ -375,10 +423,10 @@ function coinBySymbol(symbol) {
   return (S.snap?.coins || []).find((c) => c.symbol === symbol);
 }
 
-async function runAction(symbol, kind, value) {
+async function runAction(symbol, kind, value, persist = false) {
   const key = symbol.replace('/', '_');
   try {
-    const res = await post(`/api/coin/${key}/action`, { kind, value: value ?? null });
+    const res = await post(`/api/coin/${key}/action`, { kind, value: value ?? null, persist });
     toast(`${symbol}: ${kind} queued`, res.message, 'ok', 5000);
     watchLog(symbol);
     if (kind === 'retire') offerDisable(symbol);
@@ -568,6 +616,14 @@ function badges(coin) {
   else if (nb.kind === 'trail') out.push(['info', `BUY-TRAIL${nb.manual ? ' MAN' : ''} →${price(nb.price, p)}`]);
   else if (nb.kind === 'grid_full') out.push(['bad', 'GRID FULL']);
   else if (nb.kind === 'buys_paused') out.push(['warn', 'BUYS PAUSED']);
+  const et = coin.entry_trigger;
+  if (et) {
+    // Amber while it's actually holding the coin back; plain while it's queued
+    // behind a grid that is still running (or a trail it already armed).
+    out.push([nb.kind === 'trigger' ? 'warn' : 'plain',
+              `${nb.kind === 'trigger' ? 'WAITING' : 'TRIGGER'} ≤${price(et.price, p)}` +
+              (et.persist ? ' · REPEAT' : '')]);
+  }
   if (ns.kind === 'target') out.push(['good', `TARGET ${price(ns.price, p)}`]);
   else if (ns.kind === 'limit') out.push(['good', `SELL LIMIT ${price(ns.price, p)}`]);
   else if (ns.kind === 'trail') out.push(['good', `SELL-TRAIL${ns.manual ? ' MAN' : ''} →${price(ns.price, p)}`]);
@@ -594,7 +650,7 @@ function nextCell(coin) {
     return d;
   };
   const buyColor = coin.next_buy.kind === 'grid_full' ? 'neg'
-    : coin.next_buy.kind === 'buys_paused' ? 'warn-text' : 'pos';
+    : ['buys_paused', 'trigger'].includes(coin.next_buy.kind) ? 'warn-text' : 'pos';
   wrap.appendChild(line('buy', coin.next_buy, buyColor));
   wrap.appendChild(line('sell', coin.next_sell, 'neg'));
   return wrap;
@@ -977,7 +1033,13 @@ function updateDetail(dtr, coin) {
     sellRows.push(['Stop-loss', `−${(coin.stop_loss_pct * 100).toFixed(2)}% → ` +
       price(coin.stop_loss_trigger, p) + '  ' + pct(coin.stop_loss_delta_pct, 3), 'neg']);
   }
+  if (coin.entry_trigger && coin.levels) {
+    buyRows.push(['Entry trigger', `${price(coin.entry_trigger.price, p)} after this grid sells` +
+      (coin.entry_trigger.persist ? ' · persistent' : '')]);
+  }
   fillKv(dtr, 'next', ['Buy', ...buyRows, 'Sell', ...sellRows]);
+  const trow = dtr.querySelector('[data-trigger]');
+  if (trow) paintTriggerRow(trow, coin);
 
   // Toggles relabel and light up live, without rebuilding the controls.
   for (const btn of dtr.querySelectorAll('.control-group button[data-action]')) {
@@ -997,7 +1059,7 @@ function updateDetail(dtr, coin) {
 const CONTROL_GROUPS = [
   { title: 'Run state', kinds: ['pause_toggle', 'pause_buys_toggle', 'arm_pause_after_sell',
                                 'arm_breakeven_exit'] },
-  { title: 'Buy',   kinds: ['arm_buy_trail', 'buy'] },
+  { title: 'Buy',   kinds: ['arm_buy_trail', 'buy'], values: ['set_entry_trigger'] },
   { title: 'Sell',  kinds: ['arm_sell_trail', 'sell_all'],
     values: ['set_target_sell', 'set_stop_loss'] },
   { title: 'Reset', kinds: ['clear_targets', 'clear_stats', 'retire'] },
@@ -1079,7 +1141,9 @@ function actionsBlock(coin) {
     }
     section.appendChild(row);
     for (const kind of group.values || []) {
-      if (kind === 'set_target_sell') {
+      if (kind === 'set_entry_trigger') {
+        section.appendChild(triggerRow(coin));
+      } else if (kind === 'set_target_sell') {
         section.appendChild(valueRow(coin, kind, 'Target sell $',
           coin.next_sell.kind === 'target' ? String(coin.next_sell.price) : '',
           'price', 'post-only limit for the whole position · above market · 0 clears'));
@@ -1092,6 +1156,86 @@ function actionsBlock(coin) {
     body.appendChild(section);
   }
   return block;
+}
+
+/* Entry trigger: price + Persist + one button that is a toggle. Disarmed it
+   reads "Set"; armed it's lit, reads "Disarm", and the input/checkbox show what
+   is armed (read-only). Built once per panel and repainted every poll by
+   paintTriggerRow(), so typing a price isn't wiped by the refresh. */
+function triggerRow(coin) {
+  const box = el('div', 'trigger-row');
+  box.dataset.trigger = '1';
+  const row = el('div', 'value-row');
+  row.appendChild(el('label', null, 'Entry trigger $'));
+  const input = el('input');
+  input.type = 'text';
+  input.inputMode = 'decimal';
+  input.placeholder = 'price';
+  const persistLbl = el('label', 'check');
+  const persist = el('input');
+  persist.type = 'checkbox';
+  persistLbl.append(persist, document.createTextNode(' Persist — re-arm after every sell'));
+  persistLbl.title = 'Keep the trigger armed for every cycle, not just the next one';
+  // Not data-action: updateDetail relabels every [data-action] button from the
+  // action catalog on each poll, which would overwrite Set / Disarm.
+  const go = el('button', 'tiny', 'Set');
+  const submit = () => {
+    const fresh = coinBySymbol(coin.symbol) || coin;
+    if (fresh.entry_trigger) {                    // armed: the button disarms
+      modal({ ...triggerCopy(fresh, 0), onConfirm: () => runAction(coin.symbol, 'set_entry_trigger', 0) });
+      return;
+    }
+    const raw = input.value.trim();
+    const value = Number(raw);
+    if (!raw || Number.isNaN(value) || value <= 0) {
+      toast('Enter a trigger price', raw || 'empty', 'err', 5000); return;
+    }
+    if (fresh.price && value >= fresh.price) {
+      toast('Trigger must be below the current price',
+            `${price(value, fresh.price_prec)} is at/above ${price(fresh.price, fresh.price_prec)}` +
+            ' — the bot waits for a drop to it', 'err', 8000);
+      return;
+    }
+    const keep = persist.checked;
+    modal({ ...triggerCopy(fresh, value, keep),
+            onConfirm: () => runAction(coin.symbol, 'set_entry_trigger', value, keep) });
+  };
+  go.onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+  row.append(input, go);
+  const note = el('div', 'small dim');
+  box.append(row, persistLbl, note);
+  paintTriggerRow(box, coin);
+  return box;
+}
+
+function paintTriggerRow(box, coin) {
+  const [input, persist, go] = [box.querySelector('input[type=text]'),
+                                box.querySelector('input[type=checkbox]'), box.querySelector('button')];
+  const note = box.lastChild;
+  const et = coin.entry_trigger;
+  const armed = !!et;
+  if (box.dataset.armed !== String(armed)) {
+    box.dataset.armed = String(armed);
+    if (!armed) input.value = '';                 // just disarmed: start clean
+  }
+  input.disabled = armed;
+  persist.disabled = armed;
+  if (armed) {
+    const shown = String(et.price);
+    if (input.value !== shown) input.value = shown;
+    persist.checked = et.persist;
+  }
+  go.classList.add('toggle');
+  go.classList.toggle('on', armed);
+  setText(go, armed ? 'Disarm' : 'Set');
+  setText(note, armed
+    ? (coin.next_buy.kind === 'trigger'
+        ? `waiting for a drop to ${price(et.price, coin.price_prec)} (${pct(et.delta_pct, 2)})`
+        : coin.levels ? 'armed — applies after the current grid sells'
+                      : 'hit — buy-trail is timing the first buy') +
+      (et.persist ? ' · persistent' : ' · one-shot')
+    : 'new grid waits for price to drop to this · must be below market');
 }
 
 function valueRow(coin, kind, label, current, placeholder, hint) {
